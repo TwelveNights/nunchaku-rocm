@@ -4,7 +4,7 @@ Python wrapper for Nunchaku's high-performance GEMV (General Matrix-Vector Multi
 
 import torch
 
-from .._C import ops
+from .dispatch import gemv_awq as _gemv_awq
 
 
 def awq_gemv_w4a16_cuda(
@@ -53,4 +53,4 @@ def awq_gemv_w4a16_cuda(
     - k: input features
     - group_size: quantization group size
     """
-    return ops.gemv_awq(in_feats, kernel, scaling_factors, zeros, m, n, k, group_size)
+    return _gemv_awq(in_feats, kernel, scaling_factors, zeros, m, n, k, group_size)

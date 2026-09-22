@@ -7,7 +7,7 @@ This module provides the :class:`W4Linear` quantized linear layer, which impleme
 import torch
 import torch.nn as nn
 
-from ..._C.ops import gemm_awq, gemv_awq
+from ...ops.dispatch import gemm_awq, gemv_awq
 from .tinychat_utils import ceil_num_groups, convert_to_tinychat_w4x16y16_linear_weight
 
 __all__ = ["W4Linear"]

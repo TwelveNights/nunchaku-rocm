@@ -6,7 +6,7 @@ import math
 
 import torch
 
-from .._C import ops
+from .backend import get_backend, load_cuda_ops
 
 
 def svdq_gemm_w4a4_cuda(
@@ -127,7 +127,55 @@ def svdq_gemm_w4a4_cuda(
         lora_scales = [1.0] * math.ceil(rank / 16)
     if alpha is None:
         alpha = 1.0
-    ops.gemm_w4a4(
+    if get_backend() == "triton":
+        from .triton.gemm_w4a4 import gemm_w4a4 as _gemm_w4a4
+
+        unsupported = {
+            # SANA-only linear-attention epilogues; unreachable from any
+            # current Python model (SANA delegates entirely to the C++ path).
+            "poolout": poolout,
+            "out_vk": out_vk,
+            "out_linearattn": out_linearattn,
+            # only used by the optional "nunchaku-fp16" attention processor;
+            # the default "flashattn2" processor uses plain SDPA instead.
+            "out_q": out_q,
+            "out_k": out_k,
+            "out_v": out_v,
+        }
+        active = sorted(name for name, value in unsupported.items() if value is not None)
+        if active:
+            raise NotImplementedError(
+                "The Triton backend does not implement these fused gemm_w4a4 epilogues yet: "
+                + ", ".join(active)
+            )
+
+        _gemm_w4a4(
+            act=act,
+            wgt=wgt,
+            out=out,
+            ascales=ascales,
+            wscales=wscales,
+            bias=bias,
+            lora_act_in=lora_act_in,
+            lora_up=lora_up,
+            wcscales=wcscales,
+            norm_q=norm_q,
+            norm_k=norm_k,
+            rotary_emb=rotary_emb,
+            qout=qout,
+            oscales=oscales,
+            smooth_factor=smooth_factor,
+            lora_down=lora_down,
+            lora_act_out=lora_act_out,
+            act_unsigned=act_unsigned,
+            fuse_silu=fuse_silu,
+            fp4=fp4,
+            alpha=alpha,
+            out_dtype=out.dtype if out is not None else torch.bfloat16,
+        )
+        return
+
+    load_cuda_ops().gemm_w4a4(
         act,
         wgt,
         out,

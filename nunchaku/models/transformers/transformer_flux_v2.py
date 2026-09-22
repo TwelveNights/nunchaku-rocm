@@ -18,6 +18,7 @@ from diffusers.models.transformers.transformer_flux import (
 from huggingface_hub import utils
 from torch.nn import GELU
 
+from ...ops.backend import get_backend
 from ...ops.fused import fused_gelu_mlp
 from ...utils import get_precision, pad_tensor
 from ..attention import NunchakuBaseAttention, NunchakuFeedForward
@@ -425,6 +426,14 @@ class NunchakuFluxTransformer2DModelV2(FluxTransformer2DModel, NunchakuModelLoad
 
         transformer.load_state_dict(converted_state_dict)
 
+        if get_backend() == "triton":
+            from ...ops.triton.layout import convert_svdq_linear_to_natural_layout
+            from ..linear import SVDQW4A4Linear
+
+            for module in transformer.modules():
+                if isinstance(module, SVDQW4A4Linear):
+                    convert_svdq_linear_to_natural_layout(module)
+
         return transformer
 
     def forward(
@@ -521,9 +530,19 @@ class NunchakuFluxTransformer2DModelV2(FluxTransformer2DModel, NunchakuModelLoad
         rotary_emb_img = image_rotary_emb[:, txt_tokens:, ...]  # .to(self.dtype)
         rotary_emb_single = image_rotary_emb
 
-        rotary_emb_txt = pack_rotemb(pad_tensor(rotary_emb_txt, 256, 1))
-        rotary_emb_img = pack_rotemb(pad_tensor(rotary_emb_img, 256, 1))
-        rotary_emb_single = pack_rotemb(pad_tensor(rotary_emb_single, 256, 1))
+        if get_backend() == "triton":
+            # the Triton gemm_w4a4 RMSNorm+RoPE epilogue consumes the natural,
+            # pre-pack_rotemb layout directly (see nunchaku/ops/triton/gemm_w4a4.py)
+            # and has no BLOCK_M-multiple padding requirement.
+            rotary_emb_txt = rotary_emb_txt.reshape(txt_tokens, *rotary_emb_txt.shape[2:])
+            rotary_emb_img = rotary_emb_img.reshape(img_tokens, *rotary_emb_img.shape[2:])
+            rotary_emb_single = rotary_emb_single.reshape(
+                txt_tokens + img_tokens, *rotary_emb_single.shape[2:]
+            )
+        else:
+            rotary_emb_txt = pack_rotemb(pad_tensor(rotary_emb_txt, 256, 1))
+            rotary_emb_img = pack_rotemb(pad_tensor(rotary_emb_img, 256, 1))
+            rotary_emb_single = pack_rotemb(pad_tensor(rotary_emb_single, 256, 1))
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(

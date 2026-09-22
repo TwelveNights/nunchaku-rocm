@@ -4,7 +4,7 @@ This module provides Python wrappers for Nunchaku's high-performance SVDQuant qu
 
 import torch
 
-from .._C import ops
+from .backend import get_backend, load_cuda_ops
 from ..utils import ceil_divide
 
 
@@ -77,5 +77,12 @@ def svdq_quantize_w4a4_act_fuse_lora_cuda(
     if lora_act_out is None:
         lora_act_out = torch.empty(batch_size_pad, rank, dtype=torch.float32, device=input.device)
 
-    ops.quantize_w4a4_act_fuse_lora(input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4)
+    if get_backend() == "triton":
+        from .triton.gemm_w4a4 import quantize_w4a4_act_fuse_lora as _quantize
+
+        _quantize(input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4)
+    else:
+        load_cuda_ops().quantize_w4a4_act_fuse_lora(
+            input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4
+        )
     return output, oscales, lora_act_out

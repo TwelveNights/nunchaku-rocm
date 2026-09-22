@@ -3,6 +3,8 @@ Implements the :class:`NunchakuSanaTransformer2DModel`,
 a quantized Sana transformer for Diffusers with efficient inference support.
 """
 
+from __future__ import annotations
+
 import os
 from pathlib import Path
 from typing import Optional
@@ -14,8 +16,6 @@ from safetensors.torch import load_file
 from torch import nn
 from torch.nn import functional as F
 
-from ..._C import QuantizedSanaModel
-from ..._C import utils as cutils
 from ...utils import get_precision
 from .utils import NunchakuModelLoaderMixin
 
@@ -333,6 +333,9 @@ def load_quantized_module(
     QuantizedSanaModel
         The loaded quantized model.
     """
+    from ..._C import QuantizedSanaModel
+    from ..._C import utils as cutils
+
     if pag_layers is None:
         pag_layers = []
     elif isinstance(pag_layers, int):

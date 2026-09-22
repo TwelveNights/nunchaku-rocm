@@ -2,6 +2,8 @@
 Implements the :class:`NunchakuFluxTransformer2dModel`, a quantized transformer for Diffusers with efficient inference and LoRA support.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -18,8 +20,6 @@ from packaging.version import Version
 from safetensors.torch import load_file
 from torch import nn
 
-from ..._C import QuantizedFluxModel
-from ..._C import utils as cutils
 from ...lora.flux.nunchaku_converter import fuse_vectors, to_nunchaku
 from ...lora.flux.utils import is_nunchaku_format
 from ...utils import check_hardware_compatibility, get_precision, load_state_dict_in_safetensors, pad_tensor
@@ -447,6 +447,9 @@ def load_quantized_module(
     QuantizedFluxModel
         Loaded quantized model.
     """
+    from ..._C import QuantizedFluxModel
+    from ..._C import utils as cutils
+
     device = torch.device(device)
     assert device.type == "cuda"
     m = QuantizedFluxModel()
