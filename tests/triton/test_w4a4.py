@@ -75,6 +75,49 @@ def test_gemm_w4a4_act_unsigned(dtype):
     torch.testing.assert_close(out.float(), a @ w.t(), rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.parametrize("act_unsigned", [False, True])
+def test_gemm_w4a4_int8_dot_matches_int32_reference(act_unsigned):
+    """
+    Directly targets the int4->int8 dot path (``USE_INT8_DOT``, gemm_w4a4.py):
+    per-group scaling is applied to an exact int32 accumulation (no float
+    rounding inside the K-loop), so the kernel's output should match a
+    reference built the same way -- per-group int32 dot products, scaled and
+    summed in fp64 -- far more tightly than the generic fp32-dequant
+    references above (which only bound against ~2e-2 relative error from the
+    old bf16-dot path's rounding). This is the case flagged as worth
+    double-checking in isolation: unsigned int4 codes ([0, 15]) must still be
+    valid *signed* int8 operands to ``tl.dot`` (Triton's AMD int8 dot path
+    only accepts ``tl.int8``, not ``tl.uint8``), which holds trivially since
+    15 fits well within the signed int8 range.
+    """
+    M, N, K, group = 128, 128, 256, 64
+    act = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device="cuda")
+    wgt = torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device="cuda")
+    ascales = (torch.rand(K // group, M, device="cuda") * 0.05 + 0.01).to(torch.float32)
+    wscales = (torch.rand(K // group, N, device="cuda") * 0.05 + 0.01).to(torch.float32)
+
+    out = w4a4.gemm_w4a4(
+        act, wgt, ascales=ascales, wscales=wscales, act_unsigned=act_unsigned, out_dtype=torch.float32
+    )
+
+    a_codes = unpack(act, K).to(torch.int32)
+    w_codes = unpack(wgt, K).to(torch.int32)
+    if not act_unsigned:
+        a_codes = torch.where(a_codes >= 8, a_codes - 16, a_codes)
+    w_codes = torch.where(w_codes >= 8, w_codes - 16, w_codes)
+
+    ref = torch.zeros(M, N, dtype=torch.float64, device="cuda")
+    for k0 in range(0, K, group):
+        a_grp = a_codes[:, k0 : k0 + group]
+        w_grp = w_codes[:, k0 : k0 + group]
+        # exact int32 dot product per group, matching tl.dot(out_dtype=tl.int32)
+        dot_i32 = (a_grp.unsqueeze(1) * w_grp.unsqueeze(0)).sum(dim=-1).to(torch.int32)
+        grp = k0 // group
+        ref += dot_i32.double() * ascales[grp].double()[:, None] * wscales[grp].double()[None, :]
+
+    torch.testing.assert_close(out.double(), ref, rtol=1e-4, atol=1e-4)
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_gemm_w4a4_fp4(dtype):
     M, N, K, group = 128, 256, 512, 16

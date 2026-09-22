@@ -177,6 +177,7 @@ def _gemm_w4a4_kernel(
     stride_lun,
     ACT_UNSIGNED: tl.constexpr,
     USE_FP4: tl.constexpr,
+    USE_INT8_DOT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     HAS_LORA: tl.constexpr,
     HAS_WCSCALE: tl.constexpr,
@@ -208,10 +209,18 @@ def _gemm_w4a4_kernel(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
 
-    # One dot per scale group. The raw 4-bit codes (and e2m1 values) are exactly
-    # representable in bf16/fp16, so the MFMA runs at full rate with no loss;
-    # the per-group scales are a rank-1 product applied to the fp32 result,
-    # which keeps their full precision instead of rounding them into the dot.
+    # One dot per scale group; the per-group scales are a rank-1 product
+    # applied to the fp32 partial result, which keeps their full precision
+    # instead of rounding them into the dot.
+    #
+    # For plain int4 (USE_INT8_DOT), decoded codes are kept as int8 and
+    # ``tl.dot`` runs int8xint8->int32, which lowers to a native low-precision
+    # matrix instruction (``v_mfma_i32_16x16x32_i8`` on CDNA3,
+    # ``v_wmma_i32_16x16x16_iu8`` on RDNA3) -- unlike bf16xbf16, which uses a
+    # slower matrix-core mode on both architectures. Int4 codes (signed
+    # [-8, 7] or unsigned [0, 15]) are exactly representable in int8, so this
+    # changes only speed, not numerics. NVFP4 (``USE_FP4``) decodes to
+    # non-integer ``e2m1`` floats and always uses the bf16/fp16 dot below.
     for k0 in tl.range(0, K, GROUP_K):
         offs_k = k0 + tl.arange(0, GROUP_K)
         k_mask = offs_k < K
@@ -237,14 +246,22 @@ def _gemm_w4a4_kernel(
                 a = tl.where(qa >= 8, qa - 16, qa).to(tl.float32)
             w = tl.where(qw >= 8, qw - 16, qw).to(tl.float32)
 
-        a = tl.where(k_mask[None, :], a, 0.0).to(DOT_DTYPE)
-        w = tl.where(k_mask[None, :], w, 0.0).to(DOT_DTYPE)
+        if USE_INT8_DOT:
+            a = tl.where(k_mask[None, :], a, 0.0).to(tl.int8)
+            w = tl.where(k_mask[None, :], w, 0.0).to(tl.int8)
+        else:
+            a = tl.where(k_mask[None, :], a, 0.0).to(DOT_DTYPE)
+            w = tl.where(k_mask[None, :], w, 0.0).to(DOT_DTYPE)
 
         grp = k0 // GROUP_K
         asc = tl.load(ascale_ptr + grp * stride_asg + offs_m, mask=m_mask, other=0.0).to(tl.float32)
         wsc = tl.load(wscale_ptr + grp * stride_wsg + offs_n, mask=n_mask, other=0.0).to(tl.float32)
 
-        acc += tl.dot(a, tl.trans(w), out_dtype=tl.float32) * asc[:, None] * wsc[None, :]
+        if USE_INT8_DOT:
+            dot = tl.dot(a, tl.trans(w), out_dtype=tl.int32).to(tl.float32)
+        else:
+            dot = tl.dot(a, tl.trans(w), out_dtype=tl.float32)
+        acc += dot * asc[:, None] * wsc[None, :]
 
     if HAS_WCSCALE:
         acc *= tl.load(wcscale_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)[None, :]
@@ -486,6 +503,7 @@ def gemm_w4a4(
         lora_up.stride(0) if has_lora else 0,
         ACT_UNSIGNED=act_unsigned,
         USE_FP4=fp4,
+        USE_INT8_DOT=not fp4,
         HAS_BIAS=bias is not None,
         HAS_LORA=has_lora,
         HAS_WCSCALE=wcscales is not None,
