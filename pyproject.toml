@@ -9,7 +9,10 @@ requires = [
 ]
 
 [project]
-name = "nunchaku"
+name = "nunchaku-rocm"
+description = "AMD ROCm/Triton fork of Nunchaku (SVDQuant) — adds a portable Triton kernel backend so quantized diffusion models run on AMD GPUs without the NVIDIA-only CUDA extension. Derivative of https://github.com/nunchaku-ai/nunchaku."
+readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 
 classifiers = [
@@ -21,6 +24,7 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
 ]
 dynamic = [ "version" ]
+urls.Upstream = "https://github.com/nunchaku-ai/nunchaku"
 dependencies = [
   "accelerate>=1.9",
   "diffusers>=0.36",

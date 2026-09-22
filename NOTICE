@@ -1,0 +1,26 @@
+nunchaku-rocm
+Copyright 2024 MIT HAN Lab
+Copyright 2026 contributors to nunchaku-rocm
+
+This product is a derivative work of Nunchaku
+(https://github.com/nunchaku-ai/nunchaku), Copyright 2024 MIT HAN Lab,
+licensed under the Apache License, Version 2.0. See LICENCE.txt for the
+full license text.
+
+Modifications from the upstream project, made to support AMD ROCm/Triton
+GPUs (which have no NVIDIA-only mma.m16n8k32-based CUDA extension):
+
+  - A new portable Triton kernel backend under nunchaku/ops/triton/,
+    reimplementing the CUDA kernels in src/kernels/ (W4A4/W8A8 GEMM with
+    fused RMSNorm+RoPE and next-layer-quantization epilogues, AWQ, fp16
+    GEMM, attention, layernorm, activation, and misc kernels), plus a
+    checkpoint-layout inverter that converts existing SVDQuant checkpoints
+    from the CUDA kernel's mma-fragment layout to natural row-major layout.
+  - Lazy backend selection (nunchaku/ops/backend.py, nunchaku/ops/dispatch.py)
+    so `import nunchaku` and model construction succeed without the compiled
+    CUDA extension, selectable via the NUNCHAKU_BACKEND environment variable.
+  - Corresponding model-level wiring and tests under tests/triton/.
+
+No changes were made to the original CUDA kernels, C++ extension, or any
+other part of the upstream project; this fork adds an additional backend
+alongside them.

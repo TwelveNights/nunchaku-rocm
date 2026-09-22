@@ -1,3 +1,19 @@
+> ## nunchaku-rocm
+>
+> This is an **AMD ROCm/Triton fork of [Nunchaku](https://github.com/nunchaku-ai/nunchaku)**,
+> not an official Nunchaku release. It adds a portable Triton kernel backend
+> (`nunchaku/ops/triton/`) so quantized models run on AMD GPUs — verified on
+> MI300X (CDNA3) and Radeon PRO W7900 (RDNA3) — without the NVIDIA-only
+> `mma.m16n8k32` CUDA extension. Select it with `NUNCHAKU_BACKEND=triton`.
+>
+> See **[`nunchaku/ops/triton/README.md`](nunchaku/ops/triton/README.md)** for
+> what's implemented, kernel benchmarks, and known gaps, and
+> **[`NOTICE`](NOTICE)** for a full list of changes from upstream. Everything
+> below this point is the original upstream README, describing the NVIDIA/CUDA
+> path this fork adds an alternative to — it is otherwise unmodified.
+
+---
+
 <div align="center" id="nunchaku_logo">
   <img src="https://www.nunchux.ai/Logo.svg" alt="logo" width="220"></img>
 </div>
