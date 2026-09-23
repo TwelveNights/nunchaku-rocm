@@ -582,8 +582,10 @@ class NunchakuFluxTransformer2DModelV2(FluxTransformer2DModel, NunchakuModelLoad
 
 def convert_flux_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """
-    Convert a state dict from the :class:`~nunchaku.models.transformers.transformer_flux.NunchakuFluxTransformer2dModel`
-    format to :class:`~nunchaku.models.transformers.transformer_flux_v2.NunchakuFluxTransformer2DModelV2` format.
+    Convert a state dict from the legacy ``NunchakuFluxTransformer2dModel``
+    checkpoint format (the CUDA-only model class, not present in this
+    ROCm/Triton-only fork) to
+    :class:`~nunchaku.models.transformers.transformer_flux_v2.NunchakuFluxTransformer2DModelV2` format.
 
     Parameters
     ----------
