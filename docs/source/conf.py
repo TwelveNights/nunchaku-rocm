@@ -36,7 +36,6 @@ extensions = [
     "sphinxcontrib.mermaid",
     "nbsphinx",
     "sphinx.ext.mathjax",
-    "breathe",
 ]
 
 templates_path = ["_templates"]

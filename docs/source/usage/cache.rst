@@ -8,13 +8,12 @@ First-Block Cache
 
 Nunchaku supports `First-Block Cache (FB Cache) <fbcache>`_ for faster long-step denoising. Example usage:
 
-.. literalinclude:: ../../../examples/flux.1-dev-cache.py
+.. literalinclude:: ../../../examples/v1/flux.1-dev-cache.py
    :language: python
-   :caption: Running FLUX.1-dev with FB Cache (`examples/flux.1-dev-cache.py <https://github.com/nunchux-ai/nunchaku/blob/main/examples/flux.1-dev-cache.py>`__)
+   :caption: Running FLUX.1-dev with FB Cache (`examples/v1/flux.1-dev-cache.py <https://github.com/nunchux-ai/nunchaku/blob/main/examples/v1/flux.1-dev-cache.py>`__)
    :linenos:
-   :emphasize-lines: 15-17
 
-Enable it with :func:`~nunchaku.caching.diffusers_adapters.flux.apply_cache_on_pipe`:
+Enable it with :func:`~nunchaku.caching.diffusers_adapters.apply_cache_on_pipe`:
 
 .. code-block:: python
 

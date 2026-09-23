@@ -7,15 +7,14 @@ Nunchaku uses pytest as its testing framework.
 After installing `nunchaku` as described in the [README](../README.md#installation), you can install the test dependencies with:
 
 ```shell
-pip install -r tests/requirements.txt
+pip install -e ".[dev]"
 ```
 
 ## Running the Tests
 
 ```shell
-HF_TOKEN=$YOUR_HF_TOKEN pytest -v tests/flux/test_flux_memory.py
-HF_TOKEN=$YOUR_HF_TOKEN pytest -v tests/flux --ignore=tests/flux/test_flux_memory.py
-HF_TOKEN=$YOUR_HF_TOKEN pytest -v tests/sana
+pytest -v tests/triton
+HF_TOKEN=$YOUR_HF_TOKEN pytest -v tests/v1
 ```
 
 > **Note:** `$YOUR_HF_TOKEN` refers to your Hugging Face access token, required to download models and datasets. You can create one at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
@@ -33,7 +32,7 @@ To test visual output correctness, you can:
 
 1. **Generate comparison images:** Run your method using the **same inputs and seeds** to ensure deterministic outputs. You can control the seed by setting the `generator` parameter in the diffusers pipeline.
 
-1. **Compute similarity:** Evaluate the similarity between your outputs and the reference images using the [LPIPS](https://arxiv.org/abs/1801.03924) metric. Use the `compute_lpips` function provided in [`tests/flux/utils.py`](flux/utils.py):
+1. **Compute similarity:** Evaluate the similarity between your outputs and the reference images using the [LPIPS](https://arxiv.org/abs/1801.03924) metric. Use the `compute_lpips` function provided in [`tests/utils.py`](utils.py):
 
    ```shell
    lpips = compute_lpips(dir1, dir2)

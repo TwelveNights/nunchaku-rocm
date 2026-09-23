@@ -5,4 +5,5 @@ nunchaku.caching
    :maxdepth: 4
 
    nunchaku.caching.diffusers_adapters
-   nunchaku.caching.utils
+   nunchaku.caching.fbcache
+   nunchaku.caching.utils_v2

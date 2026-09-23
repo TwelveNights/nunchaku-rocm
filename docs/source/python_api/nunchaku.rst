@@ -10,7 +10,6 @@ Subpackages
 
    nunchaku.models
    nunchaku.lora
-   nunchaku.pipeline
    nunchaku.ops
    nunchaku.caching
    nunchaku.utils
@@ -22,4 +21,3 @@ Utility Scripts
    :maxdepth: 1
 
    nunchaku.merge_safetensors
-   nunchaku.test

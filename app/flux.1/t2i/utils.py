@@ -25,12 +25,13 @@ def get_pipeline(
     pipeline_init_kwargs: dict = {},
 ) -> FluxPipeline:
     # NOTE (triton-only fork): the legacy quantized "schnell"/"dev" branches
-    # (NunchakuFluxTransformer2dModel, CUDA-only) were removed. Only
-    # "schnell_v2" (NunchakuFluxTransformer2DModelV2, backend-dispatched
-    # CUDA-or-Triton) is quantized here; a bf16 "dev" fallback remains since
-    # it never depended on the legacy class. There is currently no quantized
-    # "dev_v2" branch -- add one analogous to "schnell_v2" if/when needed.
-    if model_name == "schnell_v2":
+    # (NunchakuFluxTransformer2dModel, CUDA-only) were removed. "schnell" now
+    # routes to NunchakuFluxTransformer2DModelV2 (backend-dispatched
+    # CUDA-or-Triton) -- it's the only quantized schnell path left, so the
+    # CLI/gradio app's existing "schnell" argument/branches were kept as-is
+    # rather than renamed. A bf16 "dev" fallback remains since it never
+    # depended on the legacy class; there is no quantized "dev" path here.
+    if model_name in ("schnell", "schnell_v2"):
         transformer = NunchakuFluxTransformer2DModelV2.from_pretrained(
             f"nunchaku-tech/nunchaku-flux.1-schnell/svdq-{precision}_r32-flux.1-schnell.safetensors"
         )

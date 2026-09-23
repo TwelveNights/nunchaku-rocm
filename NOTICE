@@ -21,6 +21,30 @@ GPUs (which have no NVIDIA-only mma.m16n8k32-based CUDA extension):
     CUDA extension, selectable via the NUNCHAKU_BACKEND environment variable.
   - Corresponding model-level wiring and tests under tests/triton/.
 
-No changes were made to the original CUDA kernels, C++ extension, or any
-other part of the upstream project; this fork adds an additional backend
-alongside them.
+On the `main` branch, no changes were made to the original CUDA kernels,
+C++ extension, or any other part of the upstream project; that branch adds
+the Triton backend as an additional path alongside the existing CUDA one.
+
+On the `triton-only` branch, the CUDA extension and everything that only
+worked through it were removed entirely (this is a real feature loss, not
+a refactor):
+
+  - The CUDA build machinery: src/ (kernel sources), nunchaku/csrc/
+    (pybind/C++ headers), third_party/ (cutlass, Block-Sparse-Attention,
+    json, mio, spdlog), setup.py, and the wheel-building CI workflows and
+    scripts/ that depended on them.
+  - The legacy, CUDA-only model classes NunchakuFluxTransformer2dModel and
+    NunchakuSanaTransformer2DModel, and everything that only worked through
+    them: TeaCache, PuLID, IP-Adapter integration, the legacy
+    caching/diffusers_adapters Flux and SANA adapters, and all top-level
+    examples/*.py, tests/flux/, tests/sana/, and the corresponding demo
+    apps under app/.
+  - Documentation describing the removed features (docs/source/usage/lora.rst,
+    attention.rst, qencoder.rst, offload.rst, the PuLID/IP-Adapter usage
+    pages, and the CUDA/Windows build guide) and the now-unused Doxygen
+    config for the deleted C++ sources.
+
+Only NunchakuFluxTransformer2DModelV2 and the other already-portable models
+(Qwen-Image, Z-Image, SDXL) remain on `triton-only`; SANA, TeaCache, PuLID,
+and IP-Adapter have no equivalent on that branch. See that branch's own
+commit history for the itemized list of what was removed and why.

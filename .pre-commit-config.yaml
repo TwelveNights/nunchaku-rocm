@@ -36,12 +36,6 @@ repos:
       - id: black
         args: [-l, "120"]
         files: ^(nunchaku/|examples/|tests/|app/)
-  - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v21.1.5
-    hooks:
-      - id: clang-format
-        types_or: [c++, cuda]
-        args: [--style=file, --verbose]
   - repo: https://github.com/kynan/nbstripout
     rev: 0.8.1
     hooks:

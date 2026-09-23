@@ -12,10 +12,10 @@ To launch the application, simply run:
 python run_gradio.py
 ```
 
-- The demo also defaults to the FLUX.1-schnell model. To switch to the FLUX.1-dev model, use `-m dev`.
+- The demo also defaults to the FLUX.1-schnell model. FLUX.1-dev (`-m dev`) is only supported at `-p bf16` in this fork (see note below).
 - By default, the Gemma-2B model is loaded as a safety checker. To disable this feature and save GPU memory, use `--no-safety-checker`.
 - To further reduce GPU memory usage, you can enable the W4A16 text encoder by specifying `--use-qencoder`.
-- By default, only the INT4 DiT is loaded. Use `-p int4 bf16` to add a BF16 DiT for side-by-side comparison, or `-p bf16` to load only the BF16 model.
+- By default, only the INT4 DiT is loaded. Use `-p int4 bf16` to add a BF16 DiT for side-by-side comparison, or `-p bf16` to load only the BF16 model. (INT4/FP4 are only available for FLUX.1-schnell in this fork.)
 
 ## Command Line Inference
 
@@ -27,7 +27,7 @@ python generate.py --prompt "You Text Prompt"
 
 - The generated image will be saved as `output.png` by default. You can specify a different path using the `-o` or `--output-path` options.
 
-- The script defaults to using the FLUX.1-schnell model. To switch to the FLUX.1-dev model, use `-m dev`.
+- The script defaults to using the FLUX.1-schnell model. FLUX.1-dev (`-m dev`) is only supported at `-p bf16` in this fork -- INT4/FP4 quantization is only available for FLUX.1-schnell.
 
 - By default, the script uses our INT4 model. To use the BF16 model instead, specify `-p bf16`.
 
@@ -45,7 +45,7 @@ To measure the latency of our INT4 models, use the following command:
 python latency.py
 ```
 
-- The script defaults to the INT4 FLUX.1-schnell model. To switch to FLUX.1-dev, use the `-m dev` option. For BF16 precision, add `-p bf16`.
+- The script defaults to the INT4 FLUX.1-schnell model. To switch to FLUX.1-dev, use the `-m dev` option (BF16 only in this fork -- add `-p bf16`).
 - Adjust the number of inference steps and the guidance scale using `-t` and `-g`, respectively.
   - For FLUX.1-schnell, the defaults are 4 steps and a guidance scale of 0.
   - For FLUX.1-dev, the defaults are 50 steps and a guidance scale of 3.5.
@@ -67,7 +67,7 @@ python evaluate.py -p int4
 python evaluate.py -p bf16
 ```
 
-- The commands above will generate images from FLUX.1-schnell on both datasets. Use `-m dev` to switch to FLUX.1-dev, or specify a single dataset with `-d MJHQ` or `-d DCI`.
+- The commands above will generate images from FLUX.1-schnell on both datasets. Use `-m dev` to switch to FLUX.1-dev (BF16 only in this fork), or specify a single dataset with `-d MJHQ` or `-d DCI`.
 - By default, generated images are saved to `results/$MODEL/$PRECISION`. Customize the output path using the `-o` option if desired.
 - You can also adjust the number of inference steps and the guidance scale using `-t` and `-g`, respectively.
   - For FLUX.1-schnell, the defaults are 4 steps and a guidance scale of 0.

@@ -206,7 +206,7 @@ cython_debug/
 *.nsys-rep
 *.ncu-rep
 
-# Pulid
+# Model/checkpoint artifacts
 *.safetensors
 *.onnx
 .gitattributes

@@ -9,7 +9,6 @@ Check out `DeepCompressor <github_deepcompressor_>`_ for the quantization librar
    :caption: Installation
 
    installation/installation.rst
-   installation/setup_windows.rst
 
 .. toctree::
     :maxdepth: 1
@@ -18,16 +17,10 @@ Check out `DeepCompressor <github_deepcompressor_>`_ for the quantization librar
     usage/basic_usage.rst
     usage/qwen-image.rst
     usage/qwen-image-edit.rst
-    usage/lora.rst
     usage/kontext.rst
     usage/sdxl.rst
     usage/controlnet.rst
-    usage/qencoder.rst
-    usage/offload.rst
-    usage/attention.rst
     usage/cache.rst
-    usage/pulid.rst
-    usage/ip_adapter.rst
     usage/zimage.rst
 
 .. toctree::

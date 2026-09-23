@@ -3,7 +3,6 @@
 .. _github_diffusers: https://github.com/huggingface/diffusers
 .. _github_comfyui-nunchaku: https://github.com/nunchux-ai/ComfyUI-nunchaku
 .. _github_nunchaku: https://github.com/nunchux-ai/nunchaku
-.. _github_nunchaku_releases: https://github.com/nunchux-ai/nunchaku/releases
 .. _github_comfyui-nunchaku_example_workflows: https://github.com/nunchux-ai/ComfyUI-nunchaku/tree/main/example_workflows
 .. _github_comfyui-manager: https://github.com/Comfy-Org/ComfyUI-Manager
 .. _github_comfyui: https://github.com/comfyanonymous/ComfyUI

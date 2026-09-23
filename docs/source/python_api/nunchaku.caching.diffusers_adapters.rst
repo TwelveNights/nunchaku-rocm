@@ -9,5 +9,4 @@ nunchaku.caching.diffusers\_adapters
 .. toctree::
    :maxdepth: 4
 
-   nunchaku.caching.diffusers_adapters.flux
-   nunchaku.caching.diffusers_adapters.sana
+   nunchaku.caching.diffusers_adapters.flux_v2

@@ -6,11 +6,20 @@
 > MI300X (CDNA3) and Radeon PRO W7900 (RDNA3) — without the NVIDIA-only
 > `mma.m16n8k32` CUDA extension. Select it with `NUNCHAKU_BACKEND=triton`.
 >
+> **The `triton-only` branch goes further and removes the CUDA extension
+> entirely**, along with everything that only worked through it: the legacy
+> `NunchakuFluxTransformer2dModel`/SANA model classes, TeaCache, PuLID,
+> IP-Adapter, and their examples/tests/demo apps. Only
+> `NunchakuFluxTransformer2DModelV2` (and the other already-portable models:
+> Qwen-Image, Z-Image, SDXL) remain. See **[`NOTICE`](NOTICE)** for the full
+> list of removed features. As a result, **News entries and example links
+> below dated before this fork's `triton-only` branch may point to files that
+> no longer exist here** — they're kept as historical record, not as working
+> links.
+>
 > See **[`nunchaku/ops/triton/README.md`](nunchaku/ops/triton/README.md)** for
-> what's implemented, kernel benchmarks, and known gaps, and
-> **[`NOTICE`](NOTICE)** for a full list of changes from upstream. Everything
-> below this point is the original upstream README, describing the NVIDIA/CUDA
-> path this fork adds an alternative to — it is otherwise unmodified.
+> what's implemented, kernel benchmarks, and known gaps. Everything below this
+> point is the original upstream README, otherwise unmodified.
 
 ---
 
