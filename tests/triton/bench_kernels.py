@@ -35,8 +35,12 @@ for M,N,K in [(4096,3072,3072),(4096,12288,3072),(4096,3072,12288)]:
     a=(torch.rand(K//64,M,device="cuda")*.05+.01).to(torch.bfloat16)
     w=(torch.rand(K//64,N,device="cuda")*.05+.01).to(torch.bfloat16)
     out=torch.empty(M,N,dtype=torch.bfloat16,device="cuda")
-    ms=bench(lambda: w4a4.gemm_w4a4(act,wgt,out=out,ascales=a,wscales=w,out_dtype=torch.bfloat16))
-    print(f"{'w4a4 int4 M%d N%d K%d'%(M,N,K):<42}{ms:>9.3f}{2*M*N*K/ms/1e9:>11.1f}")
+    # NUNCHAKU_NATIVE_GEMM=0: the Triton kernel; default: the native int4-WMMA kernel on gfx11 (Triton elsewhere)
+    for native, label in (("0", "triton"), ("", "default")):
+        os.environ["NUNCHAKU_NATIVE_GEMM"] = native
+        ms=bench(lambda: w4a4.gemm_w4a4(act,wgt,out=out,ascales=a,wscales=w,out_dtype=torch.bfloat16))
+        print(f"{'w4a4 int4 M%d N%d K%d (%s)'%(M,N,K,label):<42}{ms:>9.3f}{2*M*N*K/ms/1e9:>11.1f}")
+    os.environ.pop("NUNCHAKU_NATIVE_GEMM")
 
 # bf16 reference for the same shapes
 for M,N,K in [(4096,3072,3072)]:
