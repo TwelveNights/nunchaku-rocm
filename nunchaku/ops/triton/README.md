@@ -52,6 +52,26 @@ generates coherent images on the MI300X via the Triton backend, verified with
 `examples/v1/flux.1-schnell-triton.py`. All 145 kernel-level tests in
 `tests/triton/` pass.
 
+`NunchakuFlux2Transformer2DModel` (FLUX.2 [klein], `transformer_flux2.py`)
+runs the community `tonera/FLUX.2-klein-*-Nunchaku` checkpoints; see
+`examples/v1/flux.2-klein-4b.py`. Checked block by block against the bf16
+diffusers model on real activations captured from a pipeline run (Klein 4B,
+1024², steps 1 and 4): per-block output correlation 0.988–1.000 across all
+5 double and 20 single blocks; end-to-end image PSNR vs bf16 15.7 dB with
+the same composition and text. The packed-QKV attention fast path of the
+fork it was ported from is CUDA-only and not carried over, and the
+`Flux2KleinKVPipeline` reference-KV-cache modes are not supported.
+
+### Attention
+
+The model attention processors call `nunchaku.ops.dispatch.scaled_dot_product_attention`,
+which runs unmasked fp16/bf16 attention on the Triton flash kernel and falls
+back to `torch.nn.functional.scaled_dot_product_attention` otherwise. torch's
+SDPA was the bottleneck on RDNA3 under Windows ROCm (~4 TFLOP/s and
+run-to-run erratic vs ~34 for the Triton kernel; FLUX.1-schnell 1024² on an
+RX 7800 XT went from 36–180 s to a steady ~18.5 s per image), and the Triton
+kernel is also slightly ahead on MI300X.
+
 ### Bugs found and fixed
 
 - **Real out-of-bounds crash**: `gemm_w4a4()` assumed `act`'s row count
@@ -125,6 +145,12 @@ each bug:
 
 ## Known gaps
 
+- **Qwen-Image, Z-Image and SDXL loaders don't convert checkpoints to the
+  natural layout.** Only the FLUX.1 and FLUX.2 `from_pretrained` call
+  `convert_svdq_linear_to_natural_layout` on the Triton backend, so the
+  others feed the CUDA mma-fragment layout to kernels that expect row-major
+  weights. Z-Image's RoPE hook also emits the CUDA-only `pack_rotemb`
+  layout. These models are untested on this backend.
 - **Unported `gemm_w4a4` epilogues.** QKV packing (`out_q`/`out_k`/`out_v`,
   only used by the optional `"nunchaku-fp16"` attention processor) and the
   SANA-only linear-attention paths (`poolout`, `out_vk`, `out_linearattn`)

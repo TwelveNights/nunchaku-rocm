@@ -20,6 +20,11 @@ GPUs (which have no NVIDIA-only mma.m16n8k32-based CUDA extension):
     so `import nunchaku` and model construction succeed without the compiled
     CUDA extension, selectable via the NUNCHAKU_BACKEND environment variable.
   - Corresponding model-level wiring and tests under tests/triton/.
+  - FLUX.2 support (nunchaku/models/transformers/transformer_flux2.py),
+    adapted from the community vitoom-nunchaku fork of Nunchaku
+    (https://huggingface.co/tonera/vitoom-nunchaku, Apache License 2.0),
+    with its CUDA-only packed-QKV attention path replaced by the Triton
+    attention kernel.
 
 On the `main` branch, no changes were made to the original CUDA kernels,
 C++ extension, or any other part of the upstream project; that branch adds

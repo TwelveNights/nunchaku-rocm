@@ -10,9 +10,11 @@
 > entirely**, along with everything that only worked through it: the legacy
 > `NunchakuFluxTransformer2dModel`/SANA model classes, TeaCache, PuLID,
 > IP-Adapter, and their examples/tests/demo apps. Only
-> `NunchakuFluxTransformer2DModelV2` (and the other already-portable models:
-> Qwen-Image, Z-Image, SDXL) remain. See **[`NOTICE`](NOTICE)** for the full
-> list of removed features. As a result, **News entries and example links
+> `NunchakuFluxTransformer2DModelV2` and `NunchakuFlux2Transformer2DModel`
+> (FLUX.2 [klein], `examples/v1/flux.2-klein-4b.py`) are verified on this
+> backend; the Qwen-Image, Z-Image and SDXL classes remain but their loaders
+> still need Triton layout conversion (see the Triton README's known gaps).
+> See **[`NOTICE`](NOTICE)** for the full list of removed features. As a result, **News entries and example links
 > below dated before this fork's `triton-only` branch may point to files that
 > no longer exist here** — they're kept as historical record, not as working
 > links.
