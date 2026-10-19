@@ -57,6 +57,14 @@ the RMSNorm+RoPE epilogue and the GELU + next-layer-quantize epilogue run on
 the fp32 tile in registers (the latter in ``_gemm_w4a4_int4_gelu_quant_kernel``,
 which then never writes the 16-bit GEMM output) instead of as separate passes
 over the stored output.
+
+Native RDNA3 path
+-----------------
+On gfx11 GPUs, int4 calls without a fused epilogue (bias / LoRA-up only) run
+the hand-written ``v_wmma_i32_16x16x16_iu4`` kernel in ``native/`` instead
+(about 2x this kernel's speed), when it supports the shapes and dtypes;
+everything else stays here. ``NUNCHAKU_NATIVE_GEMM=0`` disables it. See
+:mod:`.native.w4a4`.
 """
 
 import torch
@@ -64,6 +72,7 @@ import triton
 import triton.language as tl
 
 from ._common import gelu_tanh, matmul_group_m, num_warps_for, silu_impl
+from .native import w4a4 as _native_w4a4
 
 __all__ = [
     "gemm_w4a4",
@@ -950,6 +959,23 @@ def gemm_w4a4(
     has_lora = lora_act_in is not None and lora_up is not None
     R = lora_up.shape[1] if has_lora else 0
 
+    # Plain int4 GEMMs (bias / LoRA-up only) go to the hand-written int4-WMMA
+    # kernel on RDNA3 when it supports the call; see native/w4a4.py.
+    want_qk = norm_q is not None or norm_k is not None or rotary_emb is not None
+    if (
+        not fp4
+        and wcscales is None
+        and (alpha is None or alpha == 1.0)
+        and not want_qk
+        and not want_quant
+        and not fuse_silu
+        and _native_w4a4.try_gemm(
+            act, wgt, out2d, ascales, wscales, bias,
+            lora_act_in if has_lora else None, lora_up if has_lora else None, act_unsigned,
+        )
+    ):
+        return out
+
     if fuse_quant:
         _launch_gemm_int4_gelu_quant(
             act, wgt, out2d, ascales, wscales, bias, lora_act_in if has_lora else None, lora_up if has_lora else None,
@@ -961,7 +987,6 @@ def gemm_w4a4(
     # straddled for either int4 (64) or nvfp4 (16)
 
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
-    want_qk = norm_q is not None or norm_k is not None or rotary_emb is not None
     if want_qk:
         assert norm_q is not None and norm_k is not None and rotary_emb is not None, (
             "norm_q, norm_k, and rotary_emb must all be given together"
