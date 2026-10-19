@@ -8,6 +8,8 @@ import torch
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.transformers.transformer_z_image import ZSingleStreamAttnProcessor
 
+from ...ops.dispatch import scaled_dot_product_attention
+
 
 class NunchakuZSingleStreamAttnProcessor(ZSingleStreamAttnProcessor):
     """
@@ -47,16 +49,22 @@ class NunchakuZSingleStreamAttnProcessor(ZSingleStreamAttnProcessor):
             attention_mask = attention_mask[:, None, None, :]
 
         # Compute joint attention
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
+        if attention_mask is None and self._attention_backend is None and self._parallel_config is None:
+            # (B, T, H, D) <-> (B, H, T, D) are free transposes; the kernel takes strides
+            hidden_states = scaled_dot_product_attention(
+                query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+            ).transpose(1, 2)
+        else:
+            hidden_states = dispatch_attention_fn(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                backend=self._attention_backend,
+                parallel_config=self._parallel_config,
+            )
 
         # Reshape back
         hidden_states = hidden_states.flatten(2, 3)

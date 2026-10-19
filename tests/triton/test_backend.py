@@ -70,3 +70,37 @@ def test_load_cuda_ops_raises_clearly(backend, monkeypatch):
     monkeypatch.setattr(backend, "has_cuda_extension", lambda: False)
     with pytest.raises(RuntimeError, match="NVIDIA-only"):
         backend.load_cuda_ops()
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("layout", ["bhtd", "bthd_view"])
+def test_scaled_dot_product_attention_wrapper(dtype, layout):
+    """The SDPA drop-in matches torch for both contiguous (B, H, T, D) inputs and (B, T, H, D) transposed views."""
+    import torch
+
+    from nunchaku.ops.backend import set_backend
+    from nunchaku.ops.dispatch import scaled_dot_product_attention
+
+    if not torch.cuda.is_available():
+        pytest.skip("no GPU available")
+    set_backend("triton")
+    try:
+        dtype = getattr(torch, dtype)
+        B, H, T, D = 2, 4, 300, 128
+        if layout == "bhtd":
+            q, k, v = (torch.randn(B, H, T, D, dtype=dtype, device="cuda") for _ in range(3))
+        else:
+            q, k, v = (torch.randn(B, T, H, D, dtype=dtype, device="cuda").transpose(1, 2) for _ in range(3))
+        out = scaled_dot_product_attention(q, k, v)
+        ref = torch.nn.functional.scaled_dot_product_attention(q.float(), k.float(), v.float())
+        assert out.shape == ref.shape
+        torch.testing.assert_close(out.float(), ref, rtol=3e-2, atol=3e-2)
+
+        # a mask is outside the kernel's coverage and must fall back to torch, not be ignored
+        mask = torch.rand(B, 1, T, T, device="cuda") > 0.5
+        mask[..., 0] = True
+        out = scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        ref = torch.nn.functional.scaled_dot_product_attention(q.float(), k.float(), v.float(), attn_mask=mask)
+        torch.testing.assert_close(out.float(), ref, rtol=3e-2, atol=3e-2)
+    finally:
+        set_backend(None)

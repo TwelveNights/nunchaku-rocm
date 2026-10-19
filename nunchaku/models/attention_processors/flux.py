@@ -6,18 +6,18 @@ import math
 from typing import Optional, Tuple
 
 import torch
-from torch.nn import functional as F
 
-from ...ops.dispatch import attention_fp16
+from ...ops.dispatch import attention_fp16, scaled_dot_product_attention
 from ...ops.fused import fused_qkv_norm_rottary
 
 
 class NunchakuFluxFA2Processor:
     """
-    Fused attention processor using PyTorch's scaled dot-product attention.
+    Fused attention processor using flash-style scaled dot-product attention.
 
     This processor applies fused QKV projection, normalization, and rotary embedding,
-    then computes attention using PyTorch's built-in scaled_dot_product_attention.
+    then computes attention with :func:`~nunchaku.ops.dispatch.scaled_dot_product_attention`
+    (the Triton flash-attention kernel on the Triton backend, otherwise PyTorch's SDPA).
     """
 
     def __call__(
@@ -88,9 +88,7 @@ class NunchakuFluxFA2Processor:
         query = query.view(batch_size, -1, attn.heads, attn.head_dim).transpose(1, 2)
         key = key.view(batch_size, -1, attn.heads, attn.head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, attn.head_dim).transpose(1, 2)
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        )
+        hidden_states = scaled_dot_product_attention(query, key, value)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * attn.head_dim)
         hidden_states = hidden_states.to(query.dtype)
 

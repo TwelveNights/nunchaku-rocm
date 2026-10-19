@@ -8,6 +8,8 @@ import torch
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.transformers.transformer_qwenimage import apply_rotary_emb_qwen
 
+from ...ops.dispatch import scaled_dot_product_attention
+
 
 class NunchakuQwenImageNaiveFA2Processor:
     """
@@ -107,15 +109,21 @@ class NunchakuQwenImageNaiveFA2Processor:
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
         # Compute joint attention
-        joint_hidden_states = dispatch_attention_fn(
-            joint_query,
-            joint_key,
-            joint_value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            backend=None,
-        )
+        if attention_mask is None:
+            # (B, T, H, D) <-> (B, H, T, D) are free transposes; the kernel takes strides
+            joint_hidden_states = scaled_dot_product_attention(
+                joint_query.transpose(1, 2), joint_key.transpose(1, 2), joint_value.transpose(1, 2)
+            ).transpose(1, 2)
+        else:
+            joint_hidden_states = dispatch_attention_fn(
+                joint_query,
+                joint_key,
+                joint_value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                backend=None,
+            )
 
         # Reshape back
         joint_hidden_states = joint_hidden_states.flatten(2, 3)
