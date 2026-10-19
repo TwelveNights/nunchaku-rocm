@@ -1,4 +1,6 @@
 recursive-include nunchaku *.py *.json
+# native kernel sources, compiled at runtime with hipRTC (nunchaku/ops/triton/native/)
+recursive-include nunchaku *.hip *.h
 
 include LICENCE.txt
 include NOTICE

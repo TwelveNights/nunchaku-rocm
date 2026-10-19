@@ -51,11 +51,11 @@ For reference, dense bf16 `torch.matmul` reaches ~550 TFLOP/s on the same part.
 
 1024×1024, 4 steps, steady state, int4 r32 checkpoints:
 
-| Model | Setup | Before fusions | After | Peak VRAM |
-| --- | --- | --- | --- | --- |
-| FLUX.1-schnell | model CPU offload | 17.8 s | 12.2 s | 11.2 GiB |
-| FLUX.2 [klein] 4B | model CPU offload | 9.6 s | 7.4 s | 7.9 GiB |
-| FLUX.2 [klein] 9B | prompt encoded on CPU, transformer + VAE resident | 15.3 s | 9.3 s | 11.3 GiB |
+| Model | Setup | Before fusions | After | + native int4 GEMM | Peak VRAM |
+| --- | --- | --- | --- | --- | --- |
+| FLUX.1-schnell | model CPU offload | 17.8 s | 12.2 s | 10.8 s | 11.2 GiB |
+| FLUX.2 [klein] 4B | model CPU offload | 9.6 s | 7.4 s | 6.1 s | 7.9 GiB |
+| FLUX.2 [klein] 9B | prompt encoded on CPU, transformer + VAE resident | 15.3 s | 9.3 s | 6.5 s | 11.3 GiB |
 
 "Fusions" are the int4 GEMM / quantizer rewrite: a tiled activation
 quantizer with matrix-core LoRA-down (30 → ~300 GB/s), an int4 GEMM that
@@ -70,6 +70,104 @@ The Windows driver does not OOM past 16 GB; it silently spills into shared
 system memory, which is much slower. Keep `torch.cuda.max_memory_allocated()`
 under the card's VRAM (e.g. FLUX.2 [klein] 4B is faster with model offload
 than fully resident).
+
+"Native int4 GEMM" is the hand-written RDNA3 kernel described next.
+
+## Native int4 GEMM on RDNA3 (gfx11)
+
+RDNA3 has an int4 matrix instruction, `v_wmma_i32_16x16x16_iu4`, with twice
+the int8 rate (~140 vs ~72 TOPS on an RX 7800 XT), but Triton cannot emit
+it: it decodes the nibbles and runs the int4 GEMM on int8 WMMA. `native/`
+holds a hand-written HIP kernel built on the int4 instruction
+(`w4a4_gfx11.hip`) that `gemm_w4a4()` uses instead of the Triton kernel
+when all of these hold:
+
+- the GPU is gfx11 (RDNA3/3.5; MI300X, RDNA4, NVIDIA etc. stay on Triton);
+- int4, not NVFP4 (no `wcscales`, `alpha == 1`);
+- no fused epilogue: no `norm_q`/`norm_k`/`rotary_emb`, `qout`, or
+  `fuse_silu` (so QKV projections and FLUX.1's fc1 still run on Triton);
+- the shapes and layouts are supported (below).
+
+Anything else falls back to the Triton kernel. The maths and layouts are the
+Triton kernel's (bias, LoRA-up with the fp32 hidden state rounded to 16
+bits, signed/unsigned activations, `actual_m` row masking, bf16 or fp16);
+the integer part is exact and the result is within the same ~1 output ulp
+of an fp64 reference.
+
+**How it is built.** The `.hip` source ships with the package and is
+compiled on first use with hipRTC (`hiprtc*.dll` from the ROCm Python
+wheels' `_rocm_sdk_core` on Windows, `libhiprtc.so` next to torch's HIP
+runtime on Linux) for the exact arch present; no host compiler or MSVC is
+needed. The code object is launched through the HIP runtime torch already
+loaded, via ctypes, on torch's current stream (~10 µs of CPU per call).
+Compiling all variants takes ~1 s (measured, RX 7800 XT); after that the
+code object loads from the cache in ~10 ms, plus ~0.5 s for a one-time
+self-test of every variant against a torch reference.
+
+**Cache.** `$NUNCHAKU_CACHE_DIR/native/` if set, else
+`%LOCALAPPDATA%\nunchaku\cache\native\` on Windows and
+`${XDG_CACHE_HOME:-~/.cache}/nunchaku/native/` elsewhere. Entries are keyed
+by a hash of the source, the arch, the hipRTC library and version, and the
+compile options, and written atomically (concurrent processes are safe).
+Deleting the directory only forces a recompile. hipRTC's compiler (comgr)
+additionally keeps its own cache (`AMD_COMGR_CACHE_DIR`, by default
+`%LOCALAPPDATA%\comgr` / `~/.cache/comgr`).
+
+**Environment.**
+
+```bash
+NUNCHAKU_NATIVE_GEMM=0   # never use the native kernel
+NUNCHAKU_NATIVE_GEMM=1   # use it on any AMD GPU and raise if it cannot be built,
+                         # loaded or launched (tests/debugging); unsupported
+                         # calls still go to Triton
+# unset / auto: gfx11 only, silently falling back
+NUNCHAKU_CACHE_DIR=...   # cache root (code objects go to <dir>/native/)
+```
+
+If hipRTC is missing, the compile or the self-test fails, or a launch
+fails, the native path is disabled for the rest of the process with one
+`RuntimeWarning` and every call runs on Triton.
+
+**Constraints** (checked on the host per call; violations fall back):
+`K % 128 == 0`, `M % 8 == 0`, `N % 8 == 0`, LoRA rank `R % 16 == 0` (or no
+LoRA); `out`, `ascales`, `wscales`, `bias` and `lora_up` share one dtype
+(bf16 or fp16) and `lora_act` is fp32; unit inner strides, and 16-byte
+aligned rows and base pointers for `act`, `wgt`, the scales and the LoRA
+tensors. Every plain GEMM of FLUX.1-schnell and FLUX.2 [klein] 4B/9B meets
+them (the quantizer pads `M` to 256; `K` is 3072, 4096, 9216 or 12288; `R`
+is 32), so all of them run natively.
+
+**Kernel speed** (RX 7800 XT, bf16, bias + LoRA r32, best of 3 x 20 runs):
+
+| M x N x K | Where | Triton ms | Native ms | Native TFLOP/s | Speedup |
+| --- | --- | --- | --- | --- | --- |
+| 4096 x 3072 x 3072 | FLUX.1 attn out | 2.084 | 0.930 | 83 | 2.24x |
+| 512 x 3072 x 3072 | FLUX.1 txt attn out | 0.319 | 0.139 | 70 | 2.30x |
+| 4608 x 3072 x 12288 | FLUX.1 single fc2 | 8.902 | 3.945 | 88 | 2.26x |
+| 512 x 3072 x 12288 | FLUX.1 txt fc2 | 1.069 | 0.490 | 79 | 2.18x |
+| 4608 x 18432 x 3072 | Klein 4B single fc1 | 13.937 | 6.254 | 83 | 2.23x |
+| 4608 x 3072 x 9216 | Klein 4B single fc2 | 6.736 | 2.996 | 87 | 2.25x |
+| 4608 x 24576 x 4096 | Klein 9B single fc1 | 24.442 | 10.936 | 85 | 2.24x |
+| 4096 x 4096 x 12288 | Klein 9B fc2 | 10.619 | 4.775 | 86 | 2.22x |
+| 512 x 4096 x 4096 | Klein 9B txt attn out | 0.525 | 0.224 | 77 | 2.34x |
+
+End to end it saves 1.4 s (FLUX.1-schnell), 1.3 s (Klein 4B) and 2.8 s
+(Klein 9B) per 1024² 4-step image (table above; steady state, peak VRAM
+unchanged). FLUX.1 gains less because its QKV and fc1 GEMMs carry fused
+epilogues and stay on Triton.
+
+**Kernel notes.** Each workgroup stages 128-wide K slices of A, W and both
+scale tensors through double-buffered LDS; waves issue four int4 WMMAs per
+64-wide scale group and fold the group's scales into an fp32 accumulator.
+The int32 group sums are converted to float without `v_cvt_f32_i32` by
+starting the WMMA accumulator at the bit pattern of 1.5 x 2^23, which
+clang 22 (ROCm 7.2) miscompiles unless the constant is hidden behind an
+empty `asm volatile`; `sched_barrier`s and a branch-free loop body keep the
+next stage's global loads ahead of the current compute. The epilogue is a
+separate stage (`lora_up_bias` then an `Epi::apply` hook with the tile's
+coordinates and the LDS buffer), so fused epilogues can be added as new
+`Epi` types without touching the main loop. See the comments in
+`w4a4_gfx11.hip`.
 
 ## Status: working end to end
 
@@ -189,9 +287,13 @@ each bug:
 ## Tests
 
 ```bash
-pytest tests/triton/            # 145 tests, all passing on MI300X
+pytest tests/triton/            # all pass on MI300X (165, gfx11-only cases skipped) and RX 7800 XT (244)
 python tests/triton/bench_kernels.py
 ```
+
+`test_native_gemm.py` checks the native GEMM against an fp64 reference and
+the Triton kernel (gfx11 only), and its dispatch/fallback rules and the
+hipRTC compile/cache/launch machinery (any AMD GPU).
 
 Kernel-level tests compare against fp32 torch references computed from the
 same packed tensors the kernels read. `test_layout.py` additionally validates

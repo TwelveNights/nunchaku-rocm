@@ -25,6 +25,11 @@ GPUs (which have no NVIDIA-only mma.m16n8k32-based CUDA extension):
     (https://huggingface.co/tonera/vitoom-nunchaku, Apache License 2.0),
     with its CUDA-only packed-QKV attention path replaced by the Triton
     attention kernel.
+  - A hand-written HIP int4 W4A4 GEMM for AMD RDNA3 (gfx11) GPUs
+    (nunchaku/ops/triton/native/), using the v_wmma_i32_16x16x16_iu4
+    instruction that Triton cannot emit, compiled at runtime with hipRTC
+    and launched through the HIP runtime via ctypes; the Triton kernel
+    remains the fallback and the path on every other GPU.
 
 On the `main` branch, no changes were made to the original CUDA kernels,
 C++ extension, or any other part of the upstream project; that branch adds

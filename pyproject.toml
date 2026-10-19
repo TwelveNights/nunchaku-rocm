@@ -88,7 +88,11 @@ optional-dependencies.full = [
 ]
 
 [tool.setuptools.packages.find]
-include = [ "nunchaku" ]
+include = [ "nunchaku", "nunchaku.*" ]
+
+[tool.setuptools.package-data]
+# native kernel sources, compiled at runtime with hipRTC
+"nunchaku.ops.triton.native" = [ "*.hip", "*.h" ]
 
 [tool.black]
 line-length = 120
