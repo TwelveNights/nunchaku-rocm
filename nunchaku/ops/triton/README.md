@@ -29,7 +29,7 @@ resolves to `triton` automatically.
 | `layernorm_kernels.cu` | `layernorm.py` | |
 | `gemm_w8a8.cu`, `zgemm/gemm_w8a8.cu` | `gemm_w8a8.py` | |
 | `gemm_f16.cu`, `gemm_batched.cu` | `gemm_fp16.py` | replaces CUTLASS instantiations |
-| `awq/gemv_awq.cu`, `awq/gemm_awq.cu` | `awq.py` | decodes the TinyChat packing, then matmuls |
+| `awq/gemv_awq.cu`, `awq/gemm_awq.cu` | `awq.py` | GEMV streams the TinyChat packing (group 64); GEMM decodes, then matmuls |
 | `zgemm/gemm_w4a4.cu` | `gemm_w4a4.py` | GEMM, quantizer, RMSNorm+RoPE / next-layer-quant epilogues |
 | `zgemm/attention.cu` | `attention.py` | FlashAttention-style |
 | checkpoint layout | `layout.py` | converts a loaded checkpoint's mma-fragment tensors to natural layout |
@@ -44,6 +44,32 @@ resolves to `triton` automatically.
 | `attention_fp16` | B1 H24 T4096 D128 | 282 (torch SDPA: 264) |
 
 For reference, dense bf16 `torch.matmul` reaches ~550 TFLOP/s on the same part.
+
+(These kernel numbers predate the int4 GEMM / quantizer rewrite below.)
+
+## End to end, RX 7800 XT (gfx1101, 16 GB, Windows 11, ROCm 7.2.1, triton-windows 3.6)
+
+1024×1024, 4 steps, steady state, int4 r32 checkpoints:
+
+| Model | Setup | Before fusions | After | Peak VRAM |
+| --- | --- | --- | --- | --- |
+| FLUX.1-schnell | model CPU offload | 17.8 s | 12.2 s | 11.2 GiB |
+| FLUX.2 [klein] 4B | model CPU offload | 9.6 s | 7.4 s | 7.9 GiB |
+| FLUX.2 [klein] 9B | prompt encoded on CPU, transformer + VAE resident | 15.3 s | 9.3 s | 11.3 GiB |
+
+"Fusions" are the int4 GEMM / quantizer rewrite: a tiled activation
+quantizer with matrix-core LoRA-down (30 → ~300 GB/s), an int4 GEMM that
+decodes nibbles from 32-bit words (25 → ~37 TFLOP/s), a streaming AWQ GEMV
+for the adaLN projections, and the CUDA original's Q/K RMSNorm+RoPE and
+GELU + next-layer-quantize epilogues fused back into the GEMM. FLUX.1
+transformer step: 3.50 → 2.05 s on the 7800 XT, 501 → 301 ms on MI300X.
+Accuracy vs the bf16 model is unchanged (FLUX.1-schnell, 4 prompts: image
+PSNR vs bf16 17.73 → 18.12 dB; Klein 4B per-block correlation unchanged).
+
+The Windows driver does not OOM past 16 GB; it silently spills into shared
+system memory, which is much slower. Keep `torch.cuda.max_memory_allocated()`
+under the card's VRAM (e.g. FLUX.2 [klein] 4B is faster with model offload
+than fully resident).
 
 ## Status: working end to end
 

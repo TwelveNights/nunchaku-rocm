@@ -19,6 +19,10 @@ def _attn_configs():
     return [
         triton.Config({"BLOCK_M": bm, "BLOCK_N": bn}, num_stages=ns, num_warps=num_warps_for(nw))
         for bm, bn, ns, nw in [
+            # num_stages=1 variants: ~8% faster on RX 7800 XT (gfx1101) at FLUX's
+            # T=4608, D=128 (6.4 vs 7.0 ms) -- the extra LDS stages only add pressure
+            (128, 64, 1, 8),
+            (64, 64, 1, 4),
             (128, 64, 3, 8),
             (128, 128, 3, 8),
             (64, 64, 4, 4),

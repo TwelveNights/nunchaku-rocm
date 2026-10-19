@@ -118,6 +118,68 @@ def awq_dequantize(
     return out
 
 
+@triton.jit
+def _awq_gemv_g64_kernel(
+    x_ptr,
+    b_ptr,
+    scale_ptr,
+    zero_ptr,
+    out_ptr,
+    N,
+    K,
+    stride_xm,
+    stride_bn,
+    stride_sg,
+    stride_om,
+    BLOCK_A: tl.constexpr,
+):
+    """
+    Fused AWQ GEMV for ``group_size == 64``, streaming the packed weight once.
+
+    Walks the stored int16 tensor ``B[n // 4, :]`` in its own order instead of
+    gathering per logical element. For packed row ``a`` and stored column
+    ``e = c * 64 + b * 16 + d`` (see the module docstring), the 4 nibbles
+    ``m = 0..3`` hold logical ``(n, k) = (4a + b, 64c + (d // 8) * 32 + m * 8 + d % 8)``,
+    so one 64-column stored block is exactly one scale group ``c``. Per group:
+    ``out[n] += s[c, n] * sum_k x[k] q[n, k] + z[c, n] * sum_k x[k]``.
+    """
+    pid_n = tl.program_id(0)
+    row = tl.program_id(1).to(tl.int64)
+    BLOCK_N: tl.constexpr = BLOCK_A * 4
+
+    offs_a = pid_n * BLOCK_A + tl.arange(0, BLOCK_A)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+    offs_e = tl.arange(0, 64)
+    offs_d = tl.arange(0, 16)
+    xk = (offs_d // 8) * 32 + offs_d % 8  # logical k offset of nibble m = 0, within the group
+
+    acc = tl.zeros((BLOCK_N,), tl.float32)
+    x_row = x_ptr + row * stride_xm
+    for c in tl.range(0, K // 64):
+        raw = tl.load(
+            b_ptr + offs_a[:, None] * stride_bn + c * 64 + offs_e[None, :],
+            mask=(offs_a[:, None] < N // 4),
+            other=0,
+        ).to(tl.int32) & 0xFFFF
+        raw = tl.reshape(raw, (BLOCK_N, 16))  # rows: n = 4a + b, cols: d
+        base = x_row + c * 64
+        x0 = tl.load(base + xk).to(tl.float32)
+        x1 = tl.load(base + xk + 8).to(tl.float32)
+        x2 = tl.load(base + xk + 16).to(tl.float32)
+        x3 = tl.load(base + xk + 24).to(tl.float32)
+        part = (raw & 0xF).to(tl.float32) * x0[None, :]
+        part += ((raw >> 4) & 0xF).to(tl.float32) * x1[None, :]
+        part += ((raw >> 8) & 0xF).to(tl.float32) * x2[None, :]
+        part += ((raw >> 12) & 0xF).to(tl.float32) * x3[None, :]
+        dotq = tl.sum(part, axis=1)
+        xsum = tl.sum(x0 + x1 + x2 + x3, axis=0)
+        s = tl.load(scale_ptr + c * stride_sg + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+        z = tl.load(zero_ptr + c * stride_sg + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+        acc += s * dotq + z * xsum
+    tl.store(out_ptr + row * stride_om + offs_n, acc.to(out_ptr.dtype.element_ty), mask=n_mask)
+
+
 def awq_gemv_w4a16(
     in_feats: torch.Tensor,
     kernel: torch.Tensor,
@@ -131,9 +193,35 @@ def awq_gemv_w4a16(
     """
     AWQ W4A16 GEMV for small batch sizes.
 
-    Matches the signature of the CUDA ``gemv_awq`` op.
+    Matches the signature of the CUDA ``gemv_awq`` op. For ``group_size == 64``
+    the weight is decoded on the fly by a fused kernel that reads the packed
+    int4 weight exactly once; otherwise it is dequantized to a dense tensor and
+    multiplied.
     """
     x = in_feats.reshape(m, k)
+    if group_size == 64 and k % 64 == 0 and n % 4 == 0:
+        x = x.contiguous()
+        packed = kernel.view(torch.int16)
+        assert packed.shape == (n // 4, k), f"unexpected packed AWQ weight shape {tuple(packed.shape)}"
+        assert scaling_factors.stride(1) == 1 and zeros.stride() == scaling_factors.stride()
+        out = torch.empty(m, n, dtype=x.dtype, device=x.device)
+        BLOCK_A = 16
+        _awq_gemv_g64_kernel[(triton.cdiv(n // 4, BLOCK_A), m)](
+            x,
+            packed,
+            scaling_factors,
+            zeros,
+            out,
+            n,
+            k,
+            x.stride(0),
+            packed.stride(0),
+            scaling_factors.stride(0),
+            out.stride(0),
+            BLOCK_A=BLOCK_A,
+            num_warps=num_warps_for(4),
+        )
+        return out.reshape(*in_feats.shape[:-1], n)
     w = awq_dequantize(kernel, scaling_factors, zeros, n, k, group_size, x.dtype)
     return torch.matmul(x, w.t()).reshape(*in_feats.shape[:-1], n)
 

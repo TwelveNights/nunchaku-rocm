@@ -46,6 +46,17 @@ next layer's activation quantization (with an optional GELU and the int4
 ``+0.171875`` unsigned-shift trick) directly onto this GEMM's output tile,
 matching ``EpilogueQuantize`` composed after ``EpilogueGelu`` in the CUDA
 launch path (``gemm_w4a4_launch_impl.cuh``).
+
+Int4 fast path
+--------------
+For int4 (the common case) :func:`gemm_w4a4` runs ``_gemm_w4a4_int4_kernel``,
+which reads the packed operands as int32 words and decodes eight nibbles per
+word with bit-field extracts (see :func:`_decode_group_words`); the generic
+``_gemm_w4a4_kernel`` remains for NVFP4 and unaligned inputs. On that path
+the RMSNorm+RoPE epilogue and the GELU + next-layer-quantize epilogue run on
+the fp32 tile in registers (the latter in ``_gemm_w4a4_int4_gelu_quant_kernel``,
+which then never writes the 16-bit GEMM output) instead of as separate passes
+over the stored output.
 """
 
 import torch
@@ -129,6 +140,63 @@ def _load_nibbles(ptr, rows, byte_cols, stride_row, mask, NCOL: tl.constexpr):
     # interleave: [.., NCOL, 2] -> [.., 2 * NCOL] so column 2j/2j+1 = lo/hi of byte j
     pair = tl.join(lo, hi)
     return tl.reshape(pair, (pair.shape[0], 2 * NCOL))
+
+
+@triton.jit
+def _w4a4_epilogue(
+    acc,
+    offs_m,
+    offs_n,
+    m_mask,
+    n_mask,
+    bias_ptr,
+    lora_act_ptr,
+    lora_up_ptr,
+    wcscale_ptr,
+    R,
+    alpha,
+    stride_lam,
+    stride_lun,
+    HAS_BIAS: tl.constexpr,
+    HAS_LORA: tl.constexpr,
+    HAS_WCSCALE: tl.constexpr,
+    FUSE_SILU: tl.constexpr,
+):
+    """wcscale/alpha, low-rank up-projection, bias, optional SiLU; returns the fp32 tile."""
+    if HAS_WCSCALE:
+        acc *= tl.load(wcscale_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)[None, :]
+
+    acc *= alpha
+
+    # low-rank correction: out += lora_act @ lora_up.T
+    if HAS_LORA:
+        lacc = tl.zeros(acc.shape, tl.float32)
+        for r0 in tl.range(0, R, 16):
+            offs_r = r0 + tl.arange(0, 16)
+            r_mask = offs_r < R
+            lu = tl.load(
+                lora_up_ptr + offs_n[:, None] * stride_lun + offs_r[None, :],
+                mask=n_mask[:, None] & r_mask[None, :],
+                other=0.0,
+            )
+            # the fp32 hidden state is rounded to lora_up's 16-bit dtype so the
+            # dot runs on the matrix cores (an fp32 dot lowers to plain FMAs on
+            # RDNA3 and cost ~10% of the whole GEMM); the CUDA EpilogueLoraUp
+            # likewise feeds 16-bit operands to its mma
+            la = tl.load(
+                lora_act_ptr + offs_m[:, None] * stride_lam + offs_r[None, :],
+                mask=m_mask[:, None] & r_mask[None, :],
+                other=0.0,
+            ).to(lu.dtype)
+            lacc = tl.dot(la, tl.trans(lu), lacc)
+        acc += lacc
+
+    if HAS_BIAS:
+        acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)[None, :]
+
+    if FUSE_SILU:
+        acc = silu_impl(acc)
+    return acc
 
 
 def _w4a4_configs():
@@ -263,41 +331,358 @@ def _gemm_w4a4_kernel(
             dot = tl.dot(a, tl.trans(w), out_dtype=tl.float32)
         acc += dot * asc[:, None] * wsc[None, :]
 
-    if HAS_WCSCALE:
-        acc *= tl.load(wcscale_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)[None, :]
-
-    acc *= alpha
-
-    # low-rank correction: out += lora_act @ lora_up.T
-    if HAS_LORA:
-        lacc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
-        for r0 in tl.range(0, R, 16):
-            offs_r = r0 + tl.arange(0, 16)
-            r_mask = offs_r < R
-            la = tl.load(
-                lora_act_ptr + offs_m[:, None] * stride_lam + offs_r[None, :],
-                mask=m_mask[:, None] & r_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            lu = tl.load(
-                lora_up_ptr + offs_n[:, None] * stride_lun + offs_r[None, :],
-                mask=n_mask[:, None] & r_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            lacc = tl.dot(la, tl.trans(lu), lacc)
-        acc += lacc
-
-    if HAS_BIAS:
-        acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)[None, :]
-
-    if FUSE_SILU:
-        acc = silu_impl(acc)
+    acc = _w4a4_epilogue(
+        acc, offs_m, offs_n, m_mask, n_mask, bias_ptr, lora_act_ptr, lora_up_ptr,
+        wcscale_ptr, R, alpha, stride_lam, stride_lun, HAS_BIAS, HAS_LORA, HAS_WCSCALE, FUSE_SILU,
+    )
 
     out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :]
     tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=out_m_mask[:, None] & n_mask[None, :])
 
 
 HEAD_DIM = 128
+
+
+def _w4a4_int4_configs():
+    # int4 path (word-decoded); measured on RX 7800 XT (gfx1101) -- 64x256/8 warps
+    # and 64x128/4 warps win at FLUX shapes; num_stages=2 throughout (the AMD
+    # stream pipeliner gains nothing from deeper stages here).
+    return [
+        triton.Config(
+            {"BLOCK_M": bm, "BLOCK_N": bn, "GROUP_M": matmul_group_m()},
+            num_stages=ns,
+            num_warps=num_warps_for(nw),
+        )
+        for bm, bn, ns, nw in [
+            (64, 256, 2, 8),
+            (64, 128, 2, 4),
+            (128, 128, 2, 8),
+            (128, 64, 2, 8),
+            (64, 64, 2, 4),
+        ]
+    ]
+
+
+@triton.jit
+def _nibble_i8(w, j: tl.constexpr, UNSIGNED: tl.constexpr):
+    """Nibble ``j`` (0 = least significant) of each int32 word, as int8."""
+    if UNSIGNED:
+        return ((w >> (4 * j)) & 0xF).to(tl.int8)
+    else:
+        # shift the field to the top, then arithmetic-shift down: sign-extends
+        # in one v_bfe_i32
+        return ((w << (28 - 4 * j)) >> 28).to(tl.int8)
+
+
+@triton.jit
+def _decode_group_words(w, UNSIGNED: tl.constexpr):
+    """
+    Decode ``[R, 8]`` int32 words (one 64-element scale group per row) to
+    ``[R, 64]`` int8.
+
+    The K order produced inside the group is a fixed permutation of the
+    logical order (nibble-position-major rather than byte-major). A and W go
+    through the identical permutation, and a dot product over K is invariant
+    to it, so no shuffle back is needed. Decoding whole words this way costs
+    one bit-field extract per element, versus the byte-load + mask + compare +
+    select chain of :func:`_load_nibbles`, which made the GEMM VALU-bound.
+    """
+    x01 = tl.join(_nibble_i8(w, 0, UNSIGNED), _nibble_i8(w, 1, UNSIGNED))
+    x23 = tl.join(_nibble_i8(w, 2, UNSIGNED), _nibble_i8(w, 3, UNSIGNED))
+    x45 = tl.join(_nibble_i8(w, 4, UNSIGNED), _nibble_i8(w, 5, UNSIGNED))
+    x67 = tl.join(_nibble_i8(w, 6, UNSIGNED), _nibble_i8(w, 7, UNSIGNED))
+    x = tl.join(tl.join(x01, x23), tl.join(x45, x67))
+    return tl.reshape(x, (w.shape[0], 64))
+
+
+@triton.jit
+def _tile_ids(M, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, GROUP_M: tl.constexpr):
+    """Grouped (L2-friendly) mapping of the 1-D program id to a (pid_m, pid_n) tile."""
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
+
+
+@triton.jit
+def _int4_mainloop(
+    act_ptr,
+    wgt_ptr,
+    ascale_ptr,
+    wscale_ptr,
+    rm,
+    rn,
+    K,
+    stride_am,
+    stride_wn,
+    stride_asg,
+    stride_wsg,
+    ACT_UNSIGNED: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    ``sum_g ascale[g, m] * wscale[g, n] * (A_g @ W_g.T)`` over 64-wide groups,
+    for in-range row/col indices ``rm``/``rn`` (out-of-range tile rows/cols
+    are wrapped by the caller rather than masked; their results land only in
+    rows/cols the masked store discards). ``act``/``wgt`` are int32 words.
+    """
+    offs_w = tl.arange(0, 8)
+    a_ptrs = act_ptr + rm[:, None] * stride_am + offs_w[None, :]
+    w_ptrs = wgt_ptr + rn[:, None] * stride_wn + offs_w[None, :]
+    as_ptrs = ascale_ptr + rm
+    ws_ptrs = wscale_ptr + rn
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    # one int8 x int8 -> int32 dot per 64-wide scale group; the per-group
+    # scales are a rank-1 product applied to the fp32 partial result
+    for _ in tl.range(0, K // 64):
+        a = _decode_group_words(tl.load(a_ptrs), ACT_UNSIGNED)
+        w = _decode_group_words(tl.load(w_ptrs), False)
+        dot = tl.dot(a, tl.trans(w), out_dtype=tl.int32)
+        asc = tl.load(as_ptrs).to(tl.float32)
+        wsc = tl.load(ws_ptrs).to(tl.float32)
+        acc += dot.to(tl.float32) * asc[:, None] * wsc[None, :]
+        a_ptrs += 8
+        w_ptrs += 8
+        as_ptrs += stride_asg
+        ws_ptrs += stride_wsg
+    return acc
+
+
+def _prune_int4_configs(configs, named_args, **kwargs):
+    # the fused per-head RMSNorm+RoPE epilogue needs one head (128 columns) per tile
+    if kwargs.get("FUSE_QK_NORM", named_args.get("FUSE_QK_NORM", False)):
+        return [c for c in configs if c.kwargs["BLOCK_N"] == HEAD_DIM]
+    return configs
+
+
+@triton.jit
+def _qk_rmsnorm_rope_tile(acc, offs_m, row_mask, part, norm_q_ptr, norm_k_ptr, rot_ptr, stride_rm, eps):
+    """
+    Per-head RMSNorm + RoPE on a ``[BLOCK_M, 128]`` fp32 tile that is exactly
+    one head of the Q (``part == 0``) or K (``part == 1``) third of a QKV
+    projection; V tiles (``part == 2``) pass through. Same maths as
+    :func:`_rmsnorm_rope_qk_kernel`, applied before the output is rounded.
+    """
+    BM: tl.constexpr = acc.shape[0]
+    D: tl.constexpr = acc.shape[1]
+    offs_d = tl.arange(0, D)
+    wq = tl.load(norm_q_ptr + offs_d).to(tl.float32)
+    wk = tl.load(norm_k_ptr + offs_d).to(tl.float32)
+    w = tl.where(part == 0, wq, wk)
+    rstd = tl.rsqrt(tl.sum(acc * acc, axis=1) / D + eps)
+    x = acc * rstd[:, None] * w[None, :]
+    # rotary_emb rows are [D // 2 pairs, (sin, cos)] fp32
+    sc = tl.load(rot_ptr + offs_m[:, None].to(tl.int64) * stride_rm + offs_d[None, :], mask=row_mask[:, None], other=0.0)
+    sin, cos = tl.split(tl.reshape(sc, (BM, D // 2, 2)))
+    xe, xo = tl.split(tl.reshape(x, (BM, D // 2, 2)))
+    rot = tl.reshape(tl.join(xe * cos - xo * sin, xe * sin + xo * cos), (BM, D))
+    return tl.where(part < 2, rot, acc)
+
+
+@triton.autotune(
+    configs=_w4a4_int4_configs(),
+    key=["M", "N", "K", "FUSE_QK_NORM"],
+    prune_configs_by={"early_config_prune": _prune_int4_configs},
+)
+@triton.jit
+def _gemm_w4a4_int4_kernel(
+    act_ptr,
+    wgt_ptr,
+    out_ptr,
+    ascale_ptr,
+    wscale_ptr,
+    bias_ptr,
+    lora_act_ptr,
+    lora_up_ptr,
+    wcscale_ptr,
+    M,
+    N,
+    K,
+    R,
+    actual_m,
+    alpha,
+    stride_am,
+    stride_wn,
+    stride_asg,
+    stride_wsg,
+    stride_om,
+    stride_lam,
+    stride_lun,
+    norm_q_ptr,
+    norm_k_ptr,
+    rot_ptr,
+    stride_rm,
+    eps,
+    ACT_UNSIGNED: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_LORA: tl.constexpr,
+    HAS_WCSCALE: tl.constexpr,
+    FUSE_SILU: tl.constexpr,
+    FUSE_QK_NORM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """
+    Int4 W4A4 GEMM. ``act``/``wgt`` are the packed nibble tensors viewed as
+    int32 words (``stride_am``/``stride_wn`` in words); ``K % 64 == 0``.
+    Same maths as the int4 path of :func:`_gemm_w4a4_kernel`.
+    """
+    pid_m, pid_n = _tile_ids(M, N, BLOCK_M, BLOCK_N, GROUP_M)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    out_m_mask = offs_m < actual_m
+    acc = _int4_mainloop(
+        act_ptr, wgt_ptr, ascale_ptr, wscale_ptr, offs_m % M, offs_n % N, K, stride_am, stride_wn, stride_asg, stride_wsg,
+        ACT_UNSIGNED, BLOCK_M, BLOCK_N,
+    )
+
+    acc = _w4a4_epilogue(
+        acc, offs_m, offs_n, m_mask, n_mask, bias_ptr, lora_act_ptr, lora_up_ptr,
+        wcscale_ptr, R, alpha, stride_lam, stride_lun, HAS_BIAS, HAS_LORA, HAS_WCSCALE, FUSE_SILU,
+    )
+
+    if FUSE_QK_NORM:
+        acc = _qk_rmsnorm_rope_tile(acc, offs_m, out_m_mask, (pid_n * BLOCK_N) // (N // 3), norm_q_ptr, norm_k_ptr, rot_ptr, stride_rm, eps)
+
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :]
+    tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=out_m_mask[:, None] & n_mask[None, :])
+
+
+@triton.jit
+def _gemm_w4a4_int4_gelu_quant_kernel(
+    act_ptr,
+    wgt_ptr,
+    out_ptr,
+    ascale_ptr,
+    wscale_ptr,
+    bias_ptr,
+    lora_act_ptr,
+    lora_up_ptr,
+    qout_ptr,
+    oscale_ptr,
+    smooth_ptr,
+    lora_down_ptr,
+    lora_out_ptr,
+    M,
+    N,
+    K,
+    R,
+    R2,
+    actual_m,
+    shift_value,
+    stride_am,
+    stride_wn,
+    stride_asg,
+    stride_wsg,
+    stride_om,
+    stride_lam,
+    stride_lun,
+    stride_qm,
+    stride_osg,
+    stride_ld,
+    stride_lop,
+    stride_lom,
+    ACT_UNSIGNED: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_LORA: tl.constexpr,
+    HAS_SMOOTH: tl.constexpr,
+    HAS_LORA_DOWN: tl.constexpr,
+    STORE_OUT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """
+    Int4 GEMM whose epilogue is ``EpilogueGelu`` + ``EpilogueLoraDown`` +
+    ``EpilogueQuantize`` (unsigned int4, ``+shift_value``) of the CUDA
+    next-layer-quantize path, applied to the fp32 tile in registers: the
+    16-bit GEMM output is never written (unless ``STORE_OUT``) or re-read.
+
+    Each tile row covers ``BLOCK_N // 64`` whole quantization groups, so the
+    per-group scales are tile-local. The next layer's LoRA-down projection
+    is a reduction over all of ``N``: every tile writes its ``[BLOCK_M, R2]``
+    partial to ``lora_out[pid_n]`` (shape ``[N // BLOCK_N, M, R2]``) and the
+    caller sums over the first dim, which keeps the result deterministic.
+    """
+    pid_m, pid_n = _tile_ids(M, N, BLOCK_M, BLOCK_N, GROUP_M)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    out_m_mask = offs_m < actual_m
+    acc = _int4_mainloop(
+        act_ptr, wgt_ptr, ascale_ptr, wscale_ptr, offs_m % M, offs_n % N, K, stride_am, stride_wn, stride_asg, stride_wsg,
+        ACT_UNSIGNED, BLOCK_M, BLOCK_N,
+    )
+    acc = _w4a4_epilogue(
+        acc, offs_m, offs_n, m_mask, n_mask, bias_ptr, lora_act_ptr, lora_up_ptr,
+        bias_ptr, R, 1.0, stride_lam, stride_lun, HAS_BIAS, HAS_LORA, False, False,
+    )
+    if STORE_OUT:
+        tl.store(
+            out_ptr + offs_m[:, None] * stride_om + offs_n[None, :],
+            acc.to(out_ptr.dtype.element_ty),
+            mask=out_m_mask[:, None] & n_mask[None, :],
+        )
+
+    x = gelu_tanh(acc)
+    tile_mask = m_mask[:, None] & n_mask[None, :]
+
+    # next layer's LoRA-down consumes the GELU'd activation before shift/smooth
+    if HAS_LORA_DOWN:
+        offs_r = tl.arange(0, BLOCK_R)
+        r_mask = offs_r < R2
+        ld = tl.load(
+            lora_down_ptr + offs_n[:, None] * stride_ld + offs_r[None, :],
+            mask=n_mask[:, None] & r_mask[None, :],
+            other=0.0,
+        )
+        part = tl.dot(tl.where(tile_mask, x, 0.0).to(ld.dtype), ld)
+        # per-N-tile partial sums, reduced afterwards in a fixed order: fp32
+        # atomics here made results (and, through the 4-bit network's
+        # sensitivity, whole images) vary run to run
+        tl.store(
+            lora_out_ptr + pid_n * stride_lop + offs_m[:, None] * stride_lom + offs_r[None, :],
+            part,
+            mask=m_mask[:, None] & r_mask[None, :],
+        )
+
+    x += shift_value
+    if HAS_SMOOTH:
+        x = x * (1.0 / tl.load(smooth_ptr + offs_n, mask=n_mask, other=1.0).to(tl.float32))[None, :]
+
+    NG: tl.constexpr = BLOCK_N // 64
+    xg = tl.reshape(x, (BLOCK_M, NG, 64))
+    gmax = tl.maximum(tl.max(xg, axis=2), 0.0)
+    scale = gmax / 15.0
+    scale_safe = tl.where(scale == 0.0, 1.0, scale)
+    offs_g = pid_n * NG + tl.arange(0, NG)
+    tl.store(
+        oscale_ptr + offs_g[None, :] * stride_osg + offs_m[:, None],
+        scale.to(oscale_ptr.dtype.element_ty),
+        mask=m_mask[:, None] & (offs_g[None, :] < N // 64),
+    )
+    q = tl.reshape(xg * (1.0 / scale_safe)[:, :, None], (BLOCK_M, BLOCK_N))
+    code = tl.minimum(tl.maximum(_rint_small(q), 0.0), 15.0).to(tl.int32) & 0xF
+    lo, hi = tl.split(tl.reshape(code, (BLOCK_M, BLOCK_N // 2, 2)))
+    packed = (lo | (hi << 4)).to(tl.uint8)
+    offs_b = pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
+    tl.store(
+        qout_ptr + offs_m[:, None] * stride_qm + offs_b[None, :],
+        packed,
+        mask=m_mask[:, None] & (offs_b[None, :] < N // 2),
+    )
 
 
 @triton.jit
@@ -388,6 +773,70 @@ def _apply_rmsnorm_rope_qk(
     )
 
 
+def _launch_gemm_int4_gelu_quant(
+    act, wgt, out2d, ascales, wscales, bias, lora_act_in, lora_up, qout, oscales, smooth, lora_down, lora_act_out,
+    act_unsigned, M, N, K,
+):
+    act32, wgt32 = act.view(torch.int32), wgt.view(torch.int32)
+    qout2d = qout.reshape(-1, qout.shape[-1])
+    has_ld = lora_down is not None
+    R2 = lora_down.shape[1] if has_ld else 0
+    # fixed tile: 64x128 is the autotune winner for the plain int4 GEMM at
+    # FLUX shapes on RX 7800 XT (and wastes no LoRA-down partial storage)
+    BLOCK_M, BLOCK_N = 64, 128
+    if has_ld:
+        lora_part = torch.empty(triton.cdiv(N, BLOCK_N), M, R2, dtype=torch.float32, device=act.device)
+    dummy = act32
+    _gemm_w4a4_int4_gelu_quant_kernel[(triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)](
+        act32,
+        wgt32,
+        out2d if out2d is not None else dummy,
+        ascales,
+        wscales,
+        bias if bias is not None else dummy,
+        lora_act_in if lora_act_in is not None else dummy,
+        lora_up if lora_up is not None else dummy,
+        qout2d,
+        oscales,
+        smooth if smooth is not None else dummy,
+        lora_down if has_ld else dummy,
+        lora_part if has_ld else dummy,
+        M,
+        N,
+        K,
+        lora_up.shape[1] if lora_up is not None else 0,
+        R2,
+        out2d.shape[0] if out2d is not None else M,
+        0.171875,
+        act32.stride(0),
+        wgt32.stride(0),
+        ascales.stride(0),
+        wscales.stride(0),
+        out2d.stride(0) if out2d is not None else 0,
+        lora_act_in.stride(0) if lora_act_in is not None else 0,
+        lora_up.stride(0) if lora_up is not None else 0,
+        qout2d.stride(0),
+        oscales.stride(0),
+        lora_down.stride(0) if has_ld else 0,
+        lora_part.stride(0) if has_ld else 0,
+        lora_part.stride(1) if has_ld else 0,
+        ACT_UNSIGNED=act_unsigned,
+        HAS_BIAS=bias is not None,
+        HAS_LORA=lora_act_in is not None,
+        HAS_SMOOTH=smooth is not None,
+        HAS_LORA_DOWN=has_ld,
+        STORE_OUT=out2d is not None,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_R=max(16, triton.next_power_of_2(R2)),
+        GROUP_M=matmul_group_m(),
+        num_warps=num_warps_for(4),
+        num_stages=2,
+    )
+    if has_ld:
+        torch.sum(lora_part, dim=0, out=lora_act_out[:M])
+
+
 def gemm_w4a4(
     act: torch.Tensor,
     wgt: torch.Tensor,
@@ -459,67 +908,146 @@ def gemm_w4a4(
     group_size = 16 if fp4 else 64
     assert K % group_size == 0
 
-    if out is None:
+    word_ok = (
+        not fp4
+        and K % 64 == 0
+        and act.stride(-1) == 1
+        and wgt.stride(-1) == 1
+        and act.stride(0) % 4 == 0
+        and wgt.stride(0) % 4 == 0
+        and act.data_ptr() % 4 == 0
+        and wgt.data_ptr() % 4 == 0
+    )
+    want_quant = qout is not None or oscales is not None
+    if want_quant:
+        assert qout is not None and oscales is not None, "qout and oscales must be given together"
+    # int4 next-layer quantization fused into the GEMM epilogue (the 16-bit
+    # output then need not be materialized at all)
+    fuse_quant = (
+        word_ok
+        and want_quant
+        and norm_q is None
+        and rotary_emb is None
+        and not fuse_silu
+        and wcscales is None
+        and (alpha is None or alpha == 1.0)
+        and N % 128 == 0
+        and qout.stride(-1) == 1
+        and (lora_down is None) == (lora_act_out is None)
+    )
+
+    if out is None and not fuse_quant:
         out = torch.empty(M, N, dtype=out_dtype, device=act.device)
-    out2d = out.reshape(-1, N)
     # `act` (and ascales/lora_act_in) may be padded to more rows than the
     # caller's output buffer holds -- e.g. fused_gelu_mlp pads its quantized
     # intermediate to a multiple of 256 rows, but the final output only needs
     # the real batch size. Compute over the full M but only read/write the
     # rows that exist in every M-indexed buffer.
-    actual_m = out2d.shape[0]
+    out2d = out.reshape(-1, N) if out is not None else None
+    actual_m = out2d.shape[0] if out2d is not None else M
     assert actual_m <= M, f"out has more rows ({actual_m}) than act ({M})"
 
     has_lora = lora_act_in is not None and lora_up is not None
     R = lora_up.shape[1] if has_lora else 0
 
+    if fuse_quant:
+        _launch_gemm_int4_gelu_quant(
+            act, wgt, out2d, ascales, wscales, bias, lora_act_in if has_lora else None, lora_up if has_lora else None,
+            qout, oscales, smooth_factor, lora_down, lora_act_out, act_unsigned, M, N, K,
+        )
+        return out
+
     # the K loop steps exactly one scale group at a time, so a group is never
     # straddled for either int4 (64) or nvfp4 (16)
 
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
-    _gemm_w4a4_kernel[grid](
-        act,
-        wgt,
-        out2d,
-        ascales,
-        wscales,
-        bias if bias is not None else act,
-        lora_act_in if has_lora else act,
-        lora_up if has_lora else act,
-        wcscales if wcscales is not None else act,
-        act,
-        M,
-        N,
-        K,
-        R,
-        actual_m,
-        alpha if alpha is not None else 1.0,
-        act.stride(0),
-        wgt.stride(0),
-        ascales.stride(0),
-        wscales.stride(0),
-        out2d.stride(0),
-        lora_act_in.stride(0) if has_lora else 0,
-        lora_up.stride(0) if has_lora else 0,
-        ACT_UNSIGNED=act_unsigned,
-        USE_FP4=fp4,
-        USE_INT8_DOT=not fp4,
-        HAS_BIAS=bias is not None,
-        HAS_LORA=has_lora,
-        HAS_WCSCALE=wcscales is not None,
-        FUSE_SILU=fuse_silu,
-        DOT_DTYPE=tl.float16 if out2d.dtype == torch.float16 else tl.bfloat16,
-        GROUP_K=group_size,
-    )
-
-    if norm_q is not None or norm_k is not None or rotary_emb is not None:
+    want_qk = norm_q is not None or norm_k is not None or rotary_emb is not None
+    if want_qk:
         assert norm_q is not None and norm_k is not None and rotary_emb is not None, (
             "norm_q, norm_k, and rotary_emb must all be given together"
         )
+    fuse_qk = word_ok and want_qk and (N % 3 == 0) and ((N // 3) % HEAD_DIM == 0) and rotary_emb.dtype == torch.float32
+    if fuse_qk:
+        rot = rotary_emb.reshape(actual_m, HEAD_DIM)
+        assert rot.stride(1) == 1
+    if word_ok:
+        act32 = act.view(torch.int32)
+        wgt32 = wgt.view(torch.int32)
+        _gemm_w4a4_int4_kernel[grid](
+            act32,
+            wgt32,
+            out2d,
+            ascales,
+            wscales,
+            bias if bias is not None else act,
+            lora_act_in if has_lora else act,
+            lora_up if has_lora else act,
+            wcscales if wcscales is not None else act,
+            M,
+            N,
+            K,
+            R,
+            actual_m,
+            alpha if alpha is not None else 1.0,
+            act32.stride(0),
+            wgt32.stride(0),
+            ascales.stride(0),
+            wscales.stride(0),
+            out2d.stride(0),
+            lora_act_in.stride(0) if has_lora else 0,
+            lora_up.stride(0) if has_lora else 0,
+            norm_q if fuse_qk else act,
+            norm_k if fuse_qk else act,
+            rot if fuse_qk else act,
+            rot.stride(0) if fuse_qk else 0,
+            1e-6,
+            ACT_UNSIGNED=act_unsigned,
+            HAS_BIAS=bias is not None,
+            HAS_LORA=has_lora,
+            HAS_WCSCALE=wcscales is not None,
+            FUSE_SILU=fuse_silu,
+            FUSE_QK_NORM=fuse_qk,
+        )
+    else:
+        _gemm_w4a4_kernel[grid](
+            act,
+            wgt,
+            out2d,
+            ascales,
+            wscales,
+            bias if bias is not None else act,
+            lora_act_in if has_lora else act,
+            lora_up if has_lora else act,
+            wcscales if wcscales is not None else act,
+            act,
+            M,
+            N,
+            K,
+            R,
+            actual_m,
+            alpha if alpha is not None else 1.0,
+            act.stride(0),
+            wgt.stride(0),
+            ascales.stride(0),
+            wscales.stride(0),
+            out2d.stride(0),
+            lora_act_in.stride(0) if has_lora else 0,
+            lora_up.stride(0) if has_lora else 0,
+            ACT_UNSIGNED=act_unsigned,
+            USE_FP4=fp4,
+            USE_INT8_DOT=not fp4,
+            HAS_BIAS=bias is not None,
+            HAS_LORA=has_lora,
+            HAS_WCSCALE=wcscales is not None,
+            FUSE_SILU=fuse_silu,
+            DOT_DTYPE=tl.float16 if out2d.dtype == torch.float16 else tl.bfloat16,
+            GROUP_K=group_size,
+        )
+
+    if want_qk and not fuse_qk:
         _apply_rmsnorm_rope_qk(out2d, norm_q, norm_k, rotary_emb)
 
-    if qout is not None or oscales is not None:
-        assert qout is not None and oscales is not None, "qout and oscales must be given together"
+    if want_quant:
         shift_value = 0.0 if fp4 else 0.171875
         _launch_quantize(
             out2d,
@@ -541,6 +1069,17 @@ def gemm_w4a4(
 
 
 @triton.jit
+def _rint_small(x):
+    """
+    Round half to even for ``|x| < 2**22`` via the fp32 magic-number trick:
+    adding 1.5 * 2**23 forces rounding at the units place in the current
+    (round-to-nearest-even) mode. Two adds instead of ``_rint``'s floor/compare
+    chain; exact for the quantizer's ``[-8, 16]`` range.
+    """
+    return (x + 12582912.0) - 12582912.0
+
+
+@triton.jit
 def _rint(x):
     """Round half to even, matching ``cvt.rni``."""
     f = tl.floor(x)
@@ -551,7 +1090,7 @@ def _rint(x):
 
 
 @triton.jit
-def _quantize_row_kernel(
+def _quantize_tile_kernel(
     in_ptr,
     out_ptr,
     scale_ptr,
@@ -574,105 +1113,102 @@ def _quantize_row_kernel(
     FUSE_GELU: tl.constexpr,
     HAS_SMOOTH: tl.constexpr,
     HAS_LORA: tl.constexpr,
-    NGROUP: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ):
     """
-    Quantize one row of activations, one scale group per lane-block.
+    Quantize a ``[BLOCK_M, K]`` row block, streaming ``BLOCK_K`` columns
+    (a whole number of scale groups) at a time.
 
-    Each program handles a single row so that the per-group max reduction is a
-    plain 2-D reduce over a ``[NGROUP, GROUP]`` tile rather than a segmented
-    scan. A row is at most a few thousand elements, which fits comfortably.
+    Compared to a one-row-per-program kernel:
+    every input element is read exactly once (GELU/GLU applied once), the
+    LoRA down-projection is a ``tl.dot`` over the tile rather than a per-row
+    broadcast-multiply that re-read all of ``lora_down`` for every row, and
+    the ``[K // GROUP, M]`` scales are stored coalesced along ``M``.
     """
-    row = tl.program_id(0).to(tl.int64)
+    pid = tl.program_id(0)
+    offs_m = (pid * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    m_mask = offs_m < M
+    NG: tl.constexpr = BLOCK_K // GROUP
 
-    offs_g = tl.arange(0, NGROUP)[:, None]
-    offs_e = tl.arange(0, GROUP)[None, :]
-    offs_k = offs_g * GROUP + offs_e
-    k_mask = offs_k < K
-
-    x = tl.load(in_ptr + row * stride_im + offs_k, mask=k_mask, other=0.0).to(tl.float32)
-    if FUSE_GLU:
-        gate = tl.load(in_ptr + row * stride_im + K + offs_k, mask=k_mask, other=0.0).to(tl.float32)
-        x = x * (gate / (1.0 + tl.exp(-gate)))
-    if FUSE_GELU:
-        x = gelu_tanh(x)
-    x += shift_value
-    if HAS_SMOOTH:
-        x = x / tl.load(smooth_ptr + offs_k, mask=k_mask, other=1.0).to(tl.float32)
-
-    # low-rank down-projection consumes the *unquantized, unsmoothed,
-    # unshifted* row (GELU/GLU applied if fused, nothing else): in the CUDA
-    # kernel (quantize_w4a4_fuse_lora_kernel), EpilogueLoraDown runs directly
-    # on the loaded activation fpsum, strictly before EpilogueQuantize (which
-    # applies the shift and smoothing). Confirmed by diffing against a
-    # full-precision reference: including the smoothing division here made
-    # the LoRA contribution's magnitude wrong by a large layer-dependent
-    # factor (as much as ~3.4x for an outlier-heavy layer) while its
-    # direction stayed correct (corr ~0.996) -- the signature of a spurious
-    # elementwise scale, not an orientation/permutation bug.
-    if HAS_LORA:
-        offs_r = tl.arange(0, BLOCK_R)
-        acc = tl.zeros((BLOCK_R,), tl.float32)
-        for k0 in tl.range(0, K, GROUP):
-            kk = k0 + tl.arange(0, GROUP)
-            km = kk < K
-            xv = tl.load(in_ptr + row * stride_im + kk, mask=km, other=0.0).to(tl.float32)
-            if FUSE_GLU:
-                gv = tl.load(in_ptr + row * stride_im + K + kk, mask=km, other=0.0).to(tl.float32)
-                xv = xv * (gv / (1.0 + tl.exp(-gv)))
-            if FUSE_GELU:
-                xv = gelu_tanh(xv)
-            w = tl.load(
-                lora_down_ptr + kk[:, None] * stride_ld + offs_r[None, :],
-                mask=km[:, None] & (offs_r[None, :] < R),
-                other=0.0,
-            ).to(tl.float32)
-            acc += tl.sum(xv[:, None] * w, axis=0)
-        tl.store(lora_act_ptr + row * stride_lam + offs_r, acc, mask=offs_r < R)
-
-    # per-group scale: symmetric [-qmax, qmax] normally, or [0, qmax] when the
-    # row is known non-negative (post-GELU-shift activations feeding an
-    # unsigned-int4 next layer) -- matches EpilogueQuantize's USE_UNSIGNED.
     if USE_FP4:
         qmax = 6.0
     elif UNSIGNED:
         qmax = 15.0
     else:
         qmax = 7.0
-    if UNSIGNED:
-        gmax = tl.max(tl.where(k_mask, x, 0.0), axis=1)
-    else:
-        gmax = tl.max(tl.where(k_mask, tl.abs(x), 0.0), axis=1)
-    scale = gmax / qmax
-    scale_safe = tl.where(scale == 0.0, 1.0, scale)
 
-    tl.store(
-        scale_ptr + tl.arange(0, NGROUP) * stride_sg + row,
-        scale.to(scale_ptr.dtype.element_ty),
-        mask=tl.arange(0, NGROUP) < tl.cdiv(K, GROUP),
-    )
+    if HAS_LORA:
+        offs_r = tl.arange(0, BLOCK_R)
+        r_mask = offs_r < R
+        lacc = tl.zeros((BLOCK_M, BLOCK_R), tl.float32)
 
-    q = x / scale_safe[:, None]
-    if USE_FP4:
-        code = _encode_e2m1(q)
-    elif UNSIGNED:
-        code = tl.minimum(tl.maximum(_rint(q), 0.0), 15.0).to(tl.int32) & 0xF
-    else:
-        code = tl.minimum(tl.maximum(_rint(q), -8.0), 7.0).to(tl.int32) & 0xF
+    for k0 in tl.range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        mask = m_mask[:, None] & (offs_k[None, :] < K)
+        x = tl.load(in_ptr + offs_m[:, None] * stride_im + offs_k[None, :], mask=mask, other=0.0).to(tl.float32)
+        if FUSE_GLU:
+            gate = tl.load(in_ptr + offs_m[:, None] * stride_im + K + offs_k[None, :], mask=mask, other=0.0).to(
+                tl.float32
+            )
+            x = x * (gate / (1.0 + tl.exp(-gate)))
+        if FUSE_GELU:
+            x = gelu_tanh(x)
 
-    # pack nibble pairs: lane j of the packed row holds logical 2j (low) and
-    # 2j+1 (high). Reshape to [.., 2] and combine so each output byte is
-    # produced by exactly one lane -- no atomics, no races.
-    code = tl.reshape(code, (NGROUP, GROUP // 2, 2))
-    lo = tl.reshape(tl.sum(tl.where(tl.arange(0, 2)[None, None, :] == 0, code, 0), axis=2), (NGROUP, GROUP // 2))
-    hi = tl.reshape(tl.sum(tl.where(tl.arange(0, 2)[None, None, :] == 1, code, 0), axis=2), (NGROUP, GROUP // 2))
-    packed = (lo | (hi << 4)).to(tl.uint8)
+        # LoRA-down consumes the GELU/GLU'd row before shift and smoothing
+        # (EpilogueLoraDown runs before EpilogueQuantize in the CUDA kernel).
+        if HAS_LORA:
+            w = tl.load(
+                lora_down_ptr + offs_k[:, None] * stride_ld + offs_r[None, :],
+                mask=(offs_k[:, None] < K) & r_mask[None, :],
+                other=0.0,
+            )
+            lacc = tl.dot(x.to(w.dtype), w, lacc)
 
-    offs_bg = tl.arange(0, NGROUP)[:, None]
-    offs_be = tl.arange(0, GROUP // 2)[None, :]
-    offs_b = offs_bg * (GROUP // 2) + offs_be
-    tl.store(out_ptr + row * stride_om + offs_b, packed, mask=offs_b < K // 2)
+        x += shift_value
+        if HAS_SMOOTH:
+            x = x * (1.0 / tl.load(smooth_ptr + offs_k, mask=offs_k < K, other=1.0).to(tl.float32))[None, :]
+
+        xg = tl.reshape(x, (BLOCK_M, NG, GROUP))
+        if UNSIGNED:
+            gmax = tl.max(xg, axis=2)
+        else:
+            gmax = tl.max(tl.abs(xg), axis=2)
+        gmax = tl.maximum(gmax, 0.0)
+        scale = gmax / qmax
+        scale_safe = tl.where(scale == 0.0, 1.0, scale)
+
+        offs_g = k0 // GROUP + tl.arange(0, NG)
+        tl.store(
+            scale_ptr + offs_g[None, :] * stride_sg + offs_m[:, None],
+            scale.to(scale_ptr.dtype.element_ty),
+            mask=m_mask[:, None] & (offs_g[None, :] < K // GROUP),
+        )
+
+        q = tl.reshape(xg * (1.0 / scale_safe)[:, :, None], (BLOCK_M, BLOCK_K))
+        if USE_FP4:
+            code = _encode_e2m1(q)
+        elif UNSIGNED:
+            code = tl.minimum(tl.maximum(_rint_small(q), 0.0), 15.0).to(tl.int32) & 0xF
+        else:
+            code = tl.minimum(tl.maximum(_rint_small(q), -8.0), 7.0).to(tl.int32) & 0xF
+
+        lo, hi = tl.split(tl.reshape(code, (BLOCK_M, BLOCK_K // 2, 2)))
+        packed = (lo | (hi << 4)).to(tl.uint8)
+        offs_b = k0 // 2 + tl.arange(0, BLOCK_K // 2)
+        tl.store(
+            out_ptr + offs_m[:, None] * stride_om + offs_b[None, :],
+            packed,
+            mask=m_mask[:, None] & (offs_b[None, :] < K // 2),
+        )
+
+    if HAS_LORA:
+        tl.store(
+            lora_act_ptr + offs_m[:, None] * stride_lam + offs_r[None, :],
+            lacc,
+            mask=m_mask[:, None] & r_mask[None, :],
+        )
 
 
 def _launch_quantize(
@@ -697,8 +1233,10 @@ def _launch_quantize(
     has_lora = lora_down is not None and lora_act_out is not None
     R = lora_down.shape[1] if has_lora else 0
 
-    ngroup = triton.next_power_of_2(K // group)
-    _quantize_row_kernel[(M,)](
+    # measured on RX 7800 XT: 32x64 is best for large M; small M wants more programs
+    BLOCK_M = 32 if M >= 2048 else 16
+    BLOCK_K = 64
+    _quantize_tile_kernel[(triton.cdiv(M, BLOCK_M),)](
         input,
         output,
         oscales,
@@ -721,7 +1259,8 @@ def _launch_quantize(
         FUSE_GELU=fuse_gelu,
         HAS_SMOOTH=smooth is not None,
         HAS_LORA=has_lora,
-        NGROUP=ngroup,
+        BLOCK_M=BLOCK_M,
+        BLOCK_K=BLOCK_K,
         BLOCK_R=max(16, triton.next_power_of_2(R)) if has_lora else 16,
         num_warps=num_warps_for(4),
     )
