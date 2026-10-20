@@ -651,22 +651,24 @@ def _gemm_w4a4_int4_gelu_quant_kernel(
 
     # next layer's LoRA-down consumes the GELU'd activation before shift/smooth
     if HAS_LORA_DOWN:
-        offs_r = tl.arange(0, BLOCK_R)
-        r_mask = offs_r < R2
-        ld = tl.load(
-            lora_down_ptr + offs_n[:, None] * stride_ld + offs_r[None, :],
-            mask=n_mask[:, None] & r_mask[None, :],
-            other=0.0,
-        )
-        part = tl.dot(tl.where(tile_mask, x, 0.0).to(ld.dtype), ld)
-        # per-N-tile partial sums, reduced afterwards in a fixed order: fp32
-        # atomics here made results (and, through the 4-bit network's
-        # sensitivity, whole images) vary run to run
-        tl.store(
-            lora_out_ptr + pid_n * stride_lop + offs_m[:, None] * stride_lom + offs_r[None, :],
-            part,
-            mask=m_mask[:, None] & r_mask[None, :],
-        )
+        xl = tl.where(tile_mask, x, 0.0).to(lora_down_ptr.dtype.element_ty)
+        # BLOCK_R-wide chunks: LoRAs appended at runtime can make R2 large
+        for r0 in tl.range(0, R2, BLOCK_R):
+            offs_r = r0 + tl.arange(0, BLOCK_R)
+            r_mask = offs_r < R2
+            ld = tl.load(
+                lora_down_ptr + offs_n[:, None] * stride_ld + offs_r[None, :],
+                mask=n_mask[:, None] & r_mask[None, :],
+                other=0.0,
+            )
+            # per-N-tile partial sums, reduced afterwards in a fixed order: fp32
+            # atomics here made results (and, through the 4-bit network's
+            # sensitivity, whole images) vary run to run
+            tl.store(
+                lora_out_ptr + pid_n * stride_lop + offs_m[:, None] * stride_lom + offs_r[None, :],
+                tl.dot(xl, ld),
+                mask=m_mask[:, None] & r_mask[None, :],
+            )
 
     x += shift_value
     if HAS_SMOOTH:
@@ -838,7 +840,7 @@ def _launch_gemm_int4_gelu_quant(
         STORE_OUT=out2d is not None,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        BLOCK_R=max(16, triton.next_power_of_2(R2)),
+        BLOCK_R=min(64, max(16, triton.next_power_of_2(R2))),
         GROUP_M=matmul_group_m(),
         num_warps=num_warps_for(4),
         num_stages=2,
@@ -1203,6 +1205,10 @@ def _quantize_tile_kernel(
     the ``[K // GROUP, M]`` scales are stored coalesced along ``M``.
     """
     pid = tl.program_id(0)
+    # LoRA ranks above BLOCK_R are split over grid axis 1: chunk 0 also
+    # quantizes, the others only compute their slice of the LoRA-down
+    pid_r = tl.program_id(1)
+    quantize = pid_r == 0
     offs_m = (pid * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
     m_mask = offs_m < M
     NG: tl.constexpr = BLOCK_K // GROUP
@@ -1215,7 +1221,7 @@ def _quantize_tile_kernel(
         qmax = 7.0
 
     if HAS_LORA:
-        offs_r = tl.arange(0, BLOCK_R)
+        offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
         r_mask = offs_r < R
         lacc = tl.zeros((BLOCK_M, BLOCK_R), tl.float32)
 
@@ -1241,42 +1247,43 @@ def _quantize_tile_kernel(
             )
             lacc = tl.dot(x.to(w.dtype), w, lacc)
 
-        x += shift_value
-        if HAS_SMOOTH:
-            x = x * (1.0 / tl.load(smooth_ptr + offs_k, mask=offs_k < K, other=1.0).to(tl.float32))[None, :]
+        if quantize:
+            x += shift_value
+            if HAS_SMOOTH:
+                x = x * (1.0 / tl.load(smooth_ptr + offs_k, mask=offs_k < K, other=1.0).to(tl.float32))[None, :]
 
-        xg = tl.reshape(x, (BLOCK_M, NG, GROUP))
-        if UNSIGNED:
-            gmax = tl.max(xg, axis=2)
-        else:
-            gmax = tl.max(tl.abs(xg), axis=2)
-        gmax = tl.maximum(gmax, 0.0)
-        scale = gmax / qmax
-        scale_safe = tl.where(scale == 0.0, 1.0, scale)
+            xg = tl.reshape(x, (BLOCK_M, NG, GROUP))
+            if UNSIGNED:
+                gmax = tl.max(xg, axis=2)
+            else:
+                gmax = tl.max(tl.abs(xg), axis=2)
+            gmax = tl.maximum(gmax, 0.0)
+            scale = gmax / qmax
+            scale_safe = tl.where(scale == 0.0, 1.0, scale)
 
-        offs_g = k0 // GROUP + tl.arange(0, NG)
-        tl.store(
-            scale_ptr + offs_g[None, :] * stride_sg + offs_m[:, None],
-            scale.to(scale_ptr.dtype.element_ty),
-            mask=m_mask[:, None] & (offs_g[None, :] < K // GROUP),
-        )
+            offs_g = k0 // GROUP + tl.arange(0, NG)
+            tl.store(
+                scale_ptr + offs_g[None, :] * stride_sg + offs_m[:, None],
+                scale.to(scale_ptr.dtype.element_ty),
+                mask=m_mask[:, None] & (offs_g[None, :] < K // GROUP),
+            )
 
-        q = tl.reshape(xg * (1.0 / scale_safe)[:, :, None], (BLOCK_M, BLOCK_K))
-        if USE_FP4:
-            code = _encode_e2m1(q)
-        elif UNSIGNED:
-            code = tl.minimum(tl.maximum(_rint_small(q), 0.0), 15.0).to(tl.int32) & 0xF
-        else:
-            code = tl.minimum(tl.maximum(_rint_small(q), -8.0), 7.0).to(tl.int32) & 0xF
+            q = tl.reshape(xg * (1.0 / scale_safe)[:, :, None], (BLOCK_M, BLOCK_K))
+            if USE_FP4:
+                code = _encode_e2m1(q)
+            elif UNSIGNED:
+                code = tl.minimum(tl.maximum(_rint_small(q), 0.0), 15.0).to(tl.int32) & 0xF
+            else:
+                code = tl.minimum(tl.maximum(_rint_small(q), -8.0), 7.0).to(tl.int32) & 0xF
 
-        lo, hi = tl.split(tl.reshape(code, (BLOCK_M, BLOCK_K // 2, 2)))
-        packed = (lo | (hi << 4)).to(tl.uint8)
-        offs_b = k0 // 2 + tl.arange(0, BLOCK_K // 2)
-        tl.store(
-            out_ptr + offs_m[:, None] * stride_om + offs_b[None, :],
-            packed,
-            mask=m_mask[:, None] & (offs_b[None, :] < K // 2),
-        )
+            lo, hi = tl.split(tl.reshape(code, (BLOCK_M, BLOCK_K // 2, 2)))
+            packed = (lo | (hi << 4)).to(tl.uint8)
+            offs_b = k0 // 2 + tl.arange(0, BLOCK_K // 2)
+            tl.store(
+                out_ptr + offs_m[:, None] * stride_om + offs_b[None, :],
+                packed,
+                mask=m_mask[:, None] & (offs_b[None, :] < K // 2),
+            )
 
     if HAS_LORA:
         tl.store(
@@ -1311,7 +1318,8 @@ def _launch_quantize(
     # measured on RX 7800 XT: 32x64 is best for large M; small M wants more programs
     BLOCK_M = 32 if M >= 2048 else 16
     BLOCK_K = 64
-    _quantize_tile_kernel[(triton.cdiv(M, BLOCK_M),)](
+    BLOCK_R = min(128, max(16, triton.next_power_of_2(R))) if has_lora else 16
+    _quantize_tile_kernel[(triton.cdiv(M, BLOCK_M), triton.cdiv(R, BLOCK_R) if has_lora else 1)](
         input,
         output,
         oscales,
@@ -1336,7 +1344,7 @@ def _launch_quantize(
         HAS_LORA=has_lora,
         BLOCK_M=BLOCK_M,
         BLOCK_K=BLOCK_K,
-        BLOCK_R=max(16, triton.next_power_of_2(R)) if has_lora else 16,
+        BLOCK_R=BLOCK_R,
         num_warps=num_warps_for(4),
     )
 

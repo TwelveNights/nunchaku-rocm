@@ -196,8 +196,9 @@ def test_quantize_w4a4_roundtrip(dtype, fp4):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_quantize_w4a4_fuse_lora(dtype):
-    M, K, R = 64, 512, 32
+@pytest.mark.parametrize("R", [32, 288])  # 288: runtime LoRAs appended to the rank-32 branch, split over grid axis 1
+def test_quantize_w4a4_fuse_lora(dtype, R):
+    M, K = 64, 512
     x = torch.randn(M, K, dtype=dtype, device="cuda")
     lora_down = torch.randn(K, R, dtype=dtype, device="cuda") * 0.1
 
@@ -303,7 +304,8 @@ def test_gemm_w4a4_rmsnorm_rope(dtype, B, H, T):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("fp4", [False, True])
-def test_gemm_w4a4_fused_next_layer_quant(dtype, fp4):
+@pytest.mark.parametrize("R2", [32, 288])  # 288: runtime LoRAs on the next layer, LoRA-down chunked over R2
+def test_gemm_w4a4_fused_next_layer_quant(dtype, fp4, R2):
     """
     qout/oscales/smooth_factor/lora_down/lora_act_out fusion, matching
     EpilogueGelu + EpilogueQuantize + EpilogueLoraDown: GELU -> int4 unsigned
@@ -312,7 +314,7 @@ def test_gemm_w4a4_fused_next_layer_quant(dtype, fp4):
     shift or smoothing -- EpilogueLoraDown runs directly on the loaded
     activation, strictly before EpilogueQuantize applies either.
     """
-    M, K, N, R2 = 64, 256, 512, 32
+    M, K, N = 64, 256, 512
     group = 16 if fp4 else 64
 
     act = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device="cuda")
