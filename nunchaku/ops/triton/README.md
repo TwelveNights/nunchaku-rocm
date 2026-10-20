@@ -51,11 +51,15 @@ For reference, dense bf16 `torch.matmul` reaches ~550 TFLOP/s on the same part.
 
 1024×1024, 4 steps, steady state, int4 r32 checkpoints:
 
-| Model | Setup | Before fusions | After | + native int4 GEMM | Peak VRAM |
-| --- | --- | --- | --- | --- | --- |
-| FLUX.1-schnell | model CPU offload | 17.8 s | 12.2 s | 10.8 s | 11.2 GiB |
-| FLUX.2 [klein] 4B | model CPU offload | 9.6 s | 7.4 s | 6.1 s | 7.9 GiB |
-| FLUX.2 [klein] 9B | prompt encoded on CPU, transformer + VAE resident | 15.3 s | 9.3 s | 6.5 s | 11.3 GiB |
+| Model | Setup | Before fusions | After | + native int4 GEMM | + native fused epilogues | Peak VRAM |
+| --- | --- | --- | --- | --- | --- | --- |
+| FLUX.1-schnell | model CPU offload | 17.8 s | 12.2 s | 10.8 s | 8.8 s | 11.2 GiB |
+| FLUX.2 [klein] 4B | model CPU offload | 9.6 s | 7.4 s | 6.1 s | 5.8 s | 7.9 GiB |
+| FLUX.2 [klein] 9B | prompt encoded on CPU, transformer + VAE resident | 15.3 s | 9.3 s | 6.5 s | 6.9 s * | 11.3 GiB |
+
+\* Same session, Klein 9B: 10.5 s Triton only, 7.7 s native plain GEMMs, 6.9 s with
+the fused epilogues too (the machine's non-transformer time was ~1.2 s higher than
+in the earlier columns' runs; transformer step 2.10 → 1.39 → 1.17 s).
 
 "Fusions" are the int4 GEMM / quantizer rewrite: a tiled activation
 quantizer with matrix-core LoRA-down (30 → ~300 GB/s), an int4 GEMM that
@@ -71,7 +75,9 @@ system memory, which is much slower. Keep `torch.cuda.max_memory_allocated()`
 under the card's VRAM (e.g. FLUX.2 [klein] 4B is faster with model offload
 than fully resident).
 
-"Native int4 GEMM" is the hand-written RDNA3 kernel described next.
+"Native int4 GEMM" is the hand-written RDNA3 kernel described next; "native
+fused epilogues" adds its Q/K RMSNorm+RoPE and GELU + next-layer-quantize
+epilogues, so QKV projections and FLUX.1's fc1 run natively as well.
 
 ## Native int4 GEMM on RDNA3 (gfx11)
 
@@ -84,8 +90,8 @@ when all of these hold:
 
 - the GPU is gfx11 (RDNA3/3.5; MI300X, RDNA4, NVIDIA etc. stay on Triton);
 - int4, not NVFP4 (no `wcscales`, `alpha == 1`);
-- no fused epilogue: no `norm_q`/`norm_k`/`rotary_emb`, `qout`, or
-  `fuse_silu` (so QKV projections and FLUX.1's fc1 still run on Triton);
+- no `fuse_silu`; fused epilogues only of the two kinds below (Q/K
+  RMSNorm + RoPE, GELU + next-layer quantization);
 - the shapes and layouts are supported (below).
 
 Anything else falls back to the Triton kernel. The maths and layouts are the
@@ -151,10 +157,72 @@ is 32), so all of them run natively.
 | 4096 x 4096 x 12288 | Klein 9B fc2 | 10.619 | 4.775 | 86 | 2.22x |
 | 512 x 4096 x 4096 | Klein 9B txt attn out | 0.525 | 0.224 | 77 | 2.34x |
 
-End to end it saves 1.4 s (FLUX.1-schnell), 1.3 s (Klein 4B) and 2.8 s
-(Klein 9B) per 1024² 4-step image (table above; steady state, peak VRAM
-unchanged). FLUX.1 gains less because its QKV and fc1 GEMMs carry fused
-epilogues and stay on Triton.
+End to end the plain GEMMs alone save 1.4 s (FLUX.1-schnell), 1.3 s (Klein
+4B) and 2.8 s (Klein 9B) per 1024² 4-step image, and the fused epilogues
+another 2.0 s, 0.4 s and 0.8 s (table above; steady state, peak VRAM
+unchanged). Transformer step (same session): FLUX.1-schnell 2.06 → 1.70 →
+1.19 s, Klein 4B 0.98 → 0.66 → 0.56 s, Klein 9B 2.10 → 1.39 → 1.17 s
+(Triton → native plain → native fused).
+
+### Fused epilogues
+
+Two more epilogue types on the same main loop, dispatched from
+`gemm_w4a4()` under the same gfx11 / `NUNCHAKU_NATIVE_GEMM` rules (and
+self-tested on first use like the plain kernel):
+
+- **Q/K RMSNorm + RoPE** (`QKNormRopeEpilogue`, kernels `w4a4qk_*`; QKV
+  projections of FLUX.1 and both Klein models). 128 x 128 workgroup tiles
+  hold exactly one 128-wide head of the Q, K or V third. The per-row sum of
+  squares is a lane-local sum, a 16-lane DPP butterfly, and a fixed-order
+  sum of the two waves' partials through LDS; RoPE gets its pair partner
+  from the neighbouring lane (DPP) and loads `(sin, cos)` as one 8-byte
+  read. Requires `(N / 3) % 128 == 0`, bf16/fp16 `norm_q`/`norm_k` of the
+  output dtype and an fp32 rotary table. Costs ~3% over the plain native GEMM.
+- **GELU + next-layer LoRA-down + int4 quantization** (`GeluQuantEpilogue`,
+  kernels `w4a4gq_*`; FLUX.1's MLP fc1 via `fused_gelu_mlp`). GELU, the
+  next layer's LoRA-down on the 16-bit WMMA (the GELU tile and a transposed
+  `lora_down` slab staged in LDS, the slab's loads issued before the GELU
+  work), and unsigned int4 quantization per 64-group, which lives inside one
+  wave (group max: lane-local + DPP butterfly; 8 lanes OR their nibbles into
+  one word, one store per lane). The LoRA-down is reduced like the Triton
+  kernel's: one partial per N-tile, summed in a fixed order -- no atomics, so
+  results are bit-reproducible. GELU and quantization follow the Triton
+  kernel op for op (`exp` as `exp2(x log2 e)`), so the codes match it except
+  where an fp32 rounding difference in the GEMM output crosses a rounding
+  midpoint: 14 of 56.6 M codes (2.5e-7, never by more than 1) and 4.5e-6 of
+  the scales (1 ulp) at 4608 x 12288 x 3072. Requires `M % 16 == 0` (the
+  quantizer pads `M` to 256) and `N % 128 == 0`. Costs ~11% over the plain
+  native GEMM.
+
+Accuracy: the V third and the optional pre-GELU output are bit-exact on the
+integer path; Q/K outputs, `lora_act_out` and the dequantized activations
+have the same error against fp64 as the Triton fused kernels
+(`tests/triton/test_native_epilogues.py`). Model level, Klein 4B transformer
+outputs on real pipeline inputs (6 seeds x 4 steps) are as close to the bf16
+model as the Triton kernels' (mean relative L2 0.345 native fused vs 0.338
+Triton fused and 0.347 Triton with the unfused epilogue kernels; the 4-bit
+model amplifies any rounding difference, so the int4 variants differ from
+each other as much as from bf16). Images keep composition and text, except
+that small text can change between int4 variants (Klein 4B's sign reads
+"hello word" with Triton and "hlo llo word" natively).
+
+| M x N x K | Call | Triton fused ms | Native fused ms | Speedup |
+| --- | --- | --- | --- | --- |
+| 4608 x 9216 x 3072 | QKV + RMSNorm/RoPE, FLUX.1 / Klein 4B single | 7.079 | 3.235 | 2.19x |
+| 4096 x 9216 x 3072 | QKV + RMSNorm/RoPE, img stream | 6.292 | 2.866 | 2.20x |
+| 512 x 9216 x 3072 | QKV + RMSNorm/RoPE, txt stream | 0.849 | 0.380 | 2.23x |
+| 4608 x 12288 x 4096 | QKV + RMSNorm/RoPE, Klein 9B single | 12.469 | 5.633 | 2.21x |
+| 512 x 12288 x 4096 | QKV + RMSNorm/RoPE, Klein 9B txt | 1.467 | 0.639 | 2.29x |
+| 4608 x 12288 x 3072 | fc1 + GELU/quantize, FLUX.1 single | 10.032 | 4.687 | 2.14x |
+| 4096 x 12288 x 3072 | fc1 + GELU/quantize, img stream | 8.911 | 4.160 | 2.14x |
+| 512 x 12288 x 3072 | fc1 + GELU/quantize, txt stream | 1.184 | 0.551 | 2.15x |
+
+(RX 7800 XT, bf16, LoRA r32, median of 7 x 20 runs.) FLUX.2 [klein]'s
+SwiGLU MLPs are not fused: `linear_in` runs as a plain native GEMM, then
+diffusers' `silu(x[:, :H]) * x[:, H:]` and `linear_out`'s quantizer. Fusing
+them would need `linear_in`'s gate/up rows interleaved at load time and is
+estimated (from the measured cost of those two steps minus a GELU-like
+epilogue's) at ~14 ms per Klein 4B and ~30 ms per 9B transformer step (~2.5%).
 
 **Kernel notes.** Each workgroup stages 128-wide K slices of A, W and both
 scale tensors through double-buffered LDS; waves issue four int4 WMMAs per
@@ -165,7 +233,7 @@ clang 22 (ROCm 7.2) miscompiles unless the constant is hidden behind an
 empty `asm volatile`; `sched_barrier`s and a branch-free loop body keep the
 next stage's global loads ahead of the current compute. The epilogue is a
 separate stage (`lora_up_bias` then an `Epi::apply` hook with the tile's
-coordinates and the LDS buffer), so fused epilogues can be added as new
+coordinates and the LDS buffer), so fused epilogues are added as new
 `Epi` types without touching the main loop. See the comments in
 `w4a4_gfx11.hip`.
 
@@ -287,7 +355,7 @@ each bug:
 ## Tests
 
 ```bash
-pytest tests/triton/            # all pass on MI300X (165, gfx11-only cases skipped) and RX 7800 XT (244)
+pytest tests/triton/            # all pass on MI300X (171, gfx11-only cases skipped) and RX 7800 XT (289)
 python tests/triton/bench_kernels.py
 ```
 
