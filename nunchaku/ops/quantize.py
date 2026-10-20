@@ -4,8 +4,8 @@ This module provides Python wrappers for Nunchaku's high-performance SVDQuant qu
 
 import torch
 
-from .backend import get_backend, load_cuda_ops
 from ..utils import ceil_divide
+from .backend import get_backend, load_cuda_ops
 
 
 def svdq_quantize_w4a4_act_fuse_lora_cuda(

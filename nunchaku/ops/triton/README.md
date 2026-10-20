@@ -14,6 +14,7 @@ NUNCHAKU_BACKEND=triton   # or: cuda (default when nunchaku._C is importable)
 
 ```python
 from nunchaku.ops.backend import set_backend, get_backend
+
 set_backend("triton")
 ```
 
@@ -22,26 +23,26 @@ resolves to `triton` automatically.
 
 ## What is ported
 
-| CUDA source | Triton module | Notes |
-| --- | --- | --- |
-| `misc_kernels.cu` | `misc.py` | `topk` defers to `torch.topk` |
-| `activation_kernels.cu` | `activation.py` | |
-| `layernorm_kernels.cu` | `layernorm.py` | |
-| `gemm_w8a8.cu`, `zgemm/gemm_w8a8.cu` | `gemm_w8a8.py` | |
-| `gemm_f16.cu`, `gemm_batched.cu` | `gemm_fp16.py` | replaces CUTLASS instantiations |
-| `awq/gemv_awq.cu`, `awq/gemm_awq.cu` | `awq.py` | GEMV streams the TinyChat packing (group 64); GEMM decodes, then matmuls |
-| `zgemm/gemm_w4a4.cu` | `gemm_w4a4.py` | GEMM, quantizer, RMSNorm+RoPE / next-layer-quant epilogues |
-| `zgemm/attention.cu` | `attention.py` | FlashAttention-style |
-| checkpoint layout | `layout.py` | converts a loaded checkpoint's mma-fragment tensors to natural layout |
+| CUDA source                          | Triton module   | Notes                                                                    |
+| ------------------------------------ | --------------- | ------------------------------------------------------------------------ |
+| `misc_kernels.cu`                    | `misc.py`       | `topk` defers to `torch.topk`                                            |
+| `activation_kernels.cu`              | `activation.py` |                                                                          |
+| `layernorm_kernels.cu`               | `layernorm.py`  |                                                                          |
+| `gemm_w8a8.cu`, `zgemm/gemm_w8a8.cu` | `gemm_w8a8.py`  |                                                                          |
+| `gemm_f16.cu`, `gemm_batched.cu`     | `gemm_fp16.py`  | replaces CUTLASS instantiations                                          |
+| `awq/gemv_awq.cu`, `awq/gemm_awq.cu` | `awq.py`        | GEMV streams the TinyChat packing (group 64); GEMM decodes, then matmuls |
+| `zgemm/gemm_w4a4.cu`                 | `gemm_w4a4.py`  | GEMM, quantizer, RMSNorm+RoPE / next-layer-quant epilogues               |
+| `zgemm/attention.cu`                 | `attention.py`  | FlashAttention-style                                                     |
+| checkpoint layout                    | `layout.py`     | converts a loaded checkpoint's mma-fragment tensors to natural layout    |
 
 ## Measured on MI300X (gfx942, ROCm 7.0, Triton 3.6)
 
-| Kernel | Shape | TFLOP/s |
-| --- | --- | --- |
-| `gemm_w4a4` (int4) | 4096×3072×3072 | 159 |
-| `gemm_w4a4` (int4) | 4096×12288×3072 | 184 |
-| `gemm_w8a8` (int8) | 4096×3072×3072 | 535 |
-| `attention_fp16` | B1 H24 T4096 D128 | 282 (torch SDPA: 264) |
+| Kernel             | Shape             | TFLOP/s               |
+| ------------------ | ----------------- | --------------------- |
+| `gemm_w4a4` (int4) | 4096×3072×3072    | 159                   |
+| `gemm_w4a4` (int4) | 4096×12288×3072   | 184                   |
+| `gemm_w8a8` (int8) | 4096×3072×3072    | 535                   |
+| `attention_fp16`   | B1 H24 T4096 D128 | 282 (torch SDPA: 264) |
 
 For reference, dense bf16 `torch.matmul` reaches ~550 TFLOP/s on the same part.
 
@@ -51,11 +52,11 @@ For reference, dense bf16 `torch.matmul` reaches ~550 TFLOP/s on the same part.
 
 1024×1024, 4 steps, steady state, int4 r32 checkpoints:
 
-| Model | Setup | Before fusions | After | + native int4 GEMM | + native fused epilogues | + fused SwiGLU | Peak VRAM |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| FLUX.1-schnell | model CPU offload | 17.8 s | 12.2 s | 10.8 s | 8.8 s | (no SwiGLU) | 9.2 GiB (11.2 before fusions) |
-| FLUX.2 [klein] 4B | model CPU offload | 9.6 s | 7.4 s | 6.1 s | 5.8 s | 5.7 s | 7.9 GiB |
-| FLUX.2 [klein] 9B | prompt encoded on CPU, transformer + VAE resident | 15.3 s | 9.3 s | 6.5 s | 6.9 s * | 6.7 s * | 11.3 GiB |
+| Model             | Setup                                             | Before fusions | After  | + native int4 GEMM | + native fused epilogues | + fused SwiGLU | Peak VRAM                     |
+| ----------------- | ------------------------------------------------- | -------------- | ------ | ------------------ | ------------------------ | -------------- | ----------------------------- |
+| FLUX.1-schnell    | model CPU offload                                 | 17.8 s         | 12.2 s | 10.8 s             | 8.8 s                    | (no SwiGLU)    | 9.2 GiB (11.2 before fusions) |
+| FLUX.2 [klein] 4B | model CPU offload                                 | 9.6 s          | 7.4 s  | 6.1 s              | 5.8 s                    | 5.7 s          | 7.9 GiB                       |
+| FLUX.2 [klein] 9B | prompt encoded on CPU, transformer + VAE resident | 15.3 s         | 9.3 s  | 6.5 s              | 6.9 s \*                 | 6.7 s \*       | 11.3 GiB                      |
 
 \* Same session, Klein 9B: 10.5 s Triton only, 7.7 s native plain GEMMs, 6.9 s with
 the fused epilogues too, 6.7 s with the fused SwiGLU (the machine's non-transformer
@@ -149,17 +150,17 @@ is 32), so all of them run natively.
 
 **Kernel speed** (RX 7800 XT, bf16, bias + LoRA r32, best of 3 x 20 runs):
 
-| M x N x K | Where | Triton ms | Native ms | Native TFLOP/s | Speedup |
-| --- | --- | --- | --- | --- | --- |
-| 4096 x 3072 x 3072 | FLUX.1 attn out | 2.084 | 0.930 | 83 | 2.24x |
-| 512 x 3072 x 3072 | FLUX.1 txt attn out | 0.319 | 0.139 | 70 | 2.30x |
-| 4608 x 3072 x 12288 | FLUX.1 single fc2 | 8.902 | 3.945 | 88 | 2.26x |
-| 512 x 3072 x 12288 | FLUX.1 txt fc2 | 1.069 | 0.490 | 79 | 2.18x |
-| 4608 x 18432 x 3072 | Klein 4B single fc1 | 13.937 | 6.254 | 83 | 2.23x |
-| 4608 x 3072 x 9216 | Klein 4B single fc2 | 6.736 | 2.996 | 87 | 2.25x |
-| 4608 x 24576 x 4096 | Klein 9B single fc1 | 24.442 | 10.936 | 85 | 2.24x |
-| 4096 x 4096 x 12288 | Klein 9B fc2 | 10.619 | 4.775 | 86 | 2.22x |
-| 512 x 4096 x 4096 | Klein 9B txt attn out | 0.525 | 0.224 | 77 | 2.34x |
+| M x N x K           | Where                 | Triton ms | Native ms | Native TFLOP/s | Speedup |
+| ------------------- | --------------------- | --------- | --------- | -------------- | ------- |
+| 4096 x 3072 x 3072  | FLUX.1 attn out       | 2.084     | 0.930     | 83             | 2.24x   |
+| 512 x 3072 x 3072   | FLUX.1 txt attn out   | 0.319     | 0.139     | 70             | 2.30x   |
+| 4608 x 3072 x 12288 | FLUX.1 single fc2     | 8.902     | 3.945     | 88             | 2.26x   |
+| 512 x 3072 x 12288  | FLUX.1 txt fc2        | 1.069     | 0.490     | 79             | 2.18x   |
+| 4608 x 18432 x 3072 | Klein 4B single fc1   | 13.937    | 6.254     | 83             | 2.23x   |
+| 4608 x 3072 x 9216  | Klein 4B single fc2   | 6.736     | 2.996     | 87             | 2.25x   |
+| 4608 x 24576 x 4096 | Klein 9B single fc1   | 24.442    | 10.936    | 85             | 2.24x   |
+| 4096 x 4096 x 12288 | Klein 9B fc2          | 10.619    | 4.775     | 86             | 2.22x   |
+| 512 x 4096 x 4096   | Klein 9B txt attn out | 0.525     | 0.224     | 77             | 2.34x   |
 
 End to end the plain GEMMs alone save 1.4 s (FLUX.1-schnell), 1.3 s (Klein
 4B) and 2.8 s (Klein 9B) per 1024² 4-step image, and the fused epilogues
@@ -230,41 +231,42 @@ each other as much as from bf16). Images keep composition and text, except
 that small text can change between int4 variants (Klein 4B's sign reads
 "hello word" with Triton and "hlo llo word" natively).
 
-| M x N x K | Call | Triton fused ms | Native fused ms | Speedup |
-| --- | --- | --- | --- | --- |
-| 4608 x 9216 x 3072 | QKV + RMSNorm/RoPE, FLUX.1 / Klein 4B single | 7.079 | 3.235 | 2.19x |
-| 4096 x 9216 x 3072 | QKV + RMSNorm/RoPE, img stream | 6.292 | 2.866 | 2.20x |
-| 512 x 9216 x 3072 | QKV + RMSNorm/RoPE, txt stream | 0.849 | 0.380 | 2.23x |
-| 4608 x 12288 x 4096 | QKV + RMSNorm/RoPE, Klein 9B single | 12.469 | 5.633 | 2.21x |
-| 512 x 12288 x 4096 | QKV + RMSNorm/RoPE, Klein 9B txt | 1.467 | 0.639 | 2.29x |
-| 4608 x 12288 x 3072 | fc1 + GELU/quantize, FLUX.1 single | 10.032 | 4.687 | 2.14x |
-| 4096 x 12288 x 3072 | fc1 + GELU/quantize, img stream | 8.911 | 4.160 | 2.14x |
-| 512 x 12288 x 3072 | fc1 + GELU/quantize, txt stream | 1.184 | 0.551 | 2.15x |
+| M x N x K           | Call                                         | Triton fused ms | Native fused ms | Speedup |
+| ------------------- | -------------------------------------------- | --------------- | --------------- | ------- |
+| 4608 x 9216 x 3072  | QKV + RMSNorm/RoPE, FLUX.1 / Klein 4B single | 7.079           | 3.235           | 2.19x   |
+| 4096 x 9216 x 3072  | QKV + RMSNorm/RoPE, img stream               | 6.292           | 2.866           | 2.20x   |
+| 512 x 9216 x 3072   | QKV + RMSNorm/RoPE, txt stream               | 0.849           | 0.380           | 2.23x   |
+| 4608 x 12288 x 4096 | QKV + RMSNorm/RoPE, Klein 9B single          | 12.469          | 5.633           | 2.21x   |
+| 512 x 12288 x 4096  | QKV + RMSNorm/RoPE, Klein 9B txt             | 1.467           | 0.639           | 2.29x   |
+| 4608 x 12288 x 3072 | fc1 + GELU/quantize, FLUX.1 single           | 10.032          | 4.687           | 2.14x   |
+| 4096 x 12288 x 3072 | fc1 + GELU/quantize, img stream              | 8.911           | 4.160           | 2.14x   |
+| 512 x 12288 x 3072  | fc1 + GELU/quantize, txt stream              | 1.184           | 0.551           | 2.15x   |
 
 (RX 7800 XT, bf16, LoRA r32, median of 7 x 20 runs.)
 
 SwiGLU (`linear_in` M x 2H x K), unfused = native plain GEMM + `Flux2SwiGLU`
-+ Triton quantizer (the model's path before), ms:
 
-| M x 2H x K | Model | Triton unfused | Native unfused (GEMM + SwiGLU + quant) | Native fused | Saved |
-| --- | --- | --- | --- | --- | --- |
-| 4608 x 18432 x 3072 | Klein 4B single | 15.206 | 7.527 (6.238 + 0.839 + 0.425) | 6.668 | 0.859 |
-| 4096 x 18432 x 3072 | Klein 4B img | 13.570 | 6.730 (5.564 + 0.747 + 0.408) | 5.951 | 0.778 |
-| 512 x 18432 x 3072 | Klein 4B txt | 1.905 | 0.993 (0.724 + 0.076 + 0.204) | 0.781 | 0.212 |
-| 4608 x 24576 x 4096 | Klein 9B single | 26.275 | 12.679 (10.942 + 1.122 + 0.616) | 11.536 | 1.143 |
-| 512 x 24576 x 4096 | Klein 9B txt | 3.197 | 1.618 (1.248 + 0.100 + 0.263) | 1.317 | 0.301 |
+- Triton quantizer (the model's path before), ms:
+
+| M x 2H x K          | Model           | Triton unfused | Native unfused (GEMM + SwiGLU + quant) | Native fused | Saved |
+| ------------------- | --------------- | -------------- | -------------------------------------- | ------------ | ----- |
+| 4608 x 18432 x 3072 | Klein 4B single | 15.206         | 7.527 (6.238 + 0.839 + 0.425)          | 6.668        | 0.859 |
+| 4096 x 18432 x 3072 | Klein 4B img    | 13.570         | 6.730 (5.564 + 0.747 + 0.408)          | 5.951        | 0.778 |
+| 512 x 18432 x 3072  | Klein 4B txt    | 1.905          | 0.993 (0.724 + 0.076 + 0.204)          | 0.781        | 0.212 |
+| 4608 x 24576 x 4096 | Klein 9B single | 26.275         | 12.679 (10.942 + 1.122 + 0.616)        | 11.536       | 1.143 |
+| 512 x 24576 x 4096  | Klein 9B txt    | 3.197          | 1.618 (1.248 + 0.100 + 0.263)          | 1.317        | 0.301 |
 
 **LoRA-down partials.** The quantizing epilogues write one fp32 (M, R')
 partial per workgroup column and `torch.sum` reduces them in a fixed order
 (deterministic, as the Triton kernel). Measured cost of the whole LoRA-down
 (kernel with vs without `lora_down`, R' = 32), and of that sum alone:
 
-| Call | LoRA-down total | of which the sum | Partials |
-| --- | --- | --- | --- |
-| GELU fc1 4608 x 12288 x 3072 | 0.256 ms (5.7%) | 0.042 ms | 54 MB |
-| GELU fc1 512 x 12288 x 3072 | 0.030 ms (5.9%) | 0.011 ms | 6 MB |
-| SwiGLU 4B 4608 x 18432 x 3072 | 0.282 ms (4.4%) | 0.152 ms | 81 MB |
-| SwiGLU 9B 4608 x 24576 x 4096 | 0.410 ms (3.7%) | 0.199 ms | 108 MB |
+| Call                          | LoRA-down total | of which the sum | Partials |
+| ----------------------------- | --------------- | ---------------- | -------- |
+| GELU fc1 4608 x 12288 x 3072  | 0.256 ms (5.7%) | 0.042 ms         | 54 MB    |
+| GELU fc1 512 x 12288 x 3072   | 0.030 ms (5.9%) | 0.011 ms         | 6 MB     |
+| SwiGLU 4B 4608 x 18432 x 3072 | 0.282 ms (4.4%) | 0.152 ms         | 81 MB    |
+| SwiGLU 9B 4608 x 24576 x 4096 | 0.410 ms (3.7%) | 0.199 ms         | 108 MB   |
 
 The sum is bandwidth-bound (it reads every partial once); removing it
 entirely (e.g. a fixed-order in-kernel chain over workgroup columns) could
@@ -331,8 +333,7 @@ kernel is also slightly ahead on MI300X.
   a false positive — comparing raw checkpoint values against the
   full-precision reference without accounting for the SVDQuant weight
   decomposition (`w_checkpoint = quant(w_ref * smooth - lowrank)`) and the
-  unsigned-activation bias-shift correction (`bias' = bias_ref -
-  shift * rowsum(w_deq)`) makes correct plain values look permuted. Once the
+  unsigned-activation bias-shift correction (`bias' = bias_ref - shift * rowsum(w_deq)`) makes correct plain values look permuted. Once the
   comparison correctly reconstructs `main_term + lowrank_term + bias`, plain
   `bias`/`smooth_factor` match the reference almost exactly (corr ≈ 0.998).
 - **Missing unsigned (`[0, 15]`) quantization range for the next-layer-quant

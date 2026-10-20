@@ -25,7 +25,7 @@
 > FLUX.2 [klein] on AMD GPUs). Everything below this point is the original
 > upstream README, otherwise unmodified.
 
----
+______________________________________________________________________
 
 <div align="center" id="nunchaku_logo">
   <img src="https://www.nunchux.ai/Logo.svg" alt="logo" width="220"></img>

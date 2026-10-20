@@ -46,7 +46,6 @@ import comfy.utils  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from huggingface_hub import snapshot_download  # noqa: E402
-
 from nunchaku_rocm.nodes import add_lora, load_model  # noqa: E402
 
 dev, dt = mm.get_torch_device(), torch.bfloat16
@@ -94,17 +93,24 @@ def run_calls(patcher, topts):
     mm.load_models_gpu([patcher])
     dm = patcher.model.diffusion_model
     with torch.no_grad():
-        return [dm(x, torch.tensor([s], device=dev), ctx_dm, y=pooled, transformer_options=topts, **guid)
-                for s in (0.6, 0.3)]
+        return [
+            dm(x, torch.tensor([s], device=dev), ctx_dm, y=pooled, transformer_options=topts, **guid)
+            for s in (0.6, 0.3)
+        ]
 
 
 r_base, r_lora = run_calls(ref, {}), run_calls(ref_l, {})
 q_base = run_calls(ours, {})
 q_lora = run_calls(ours_l, ours_l.model_options["transformer_options"])
-print(f"{'sigma':>6} {'effect cos':>11} {'effect rel-L2':>14} {'effect size (bf16)':>19} {'ours+LoRA vs bf16+LoRA':>23}")
+print(
+    f"{'sigma':>6} {'effect cos':>11} {'effect rel-L2':>14} {'effect size (bf16)':>19} {'ours+LoRA vs bf16+LoRA':>23}"
+)
 for s, rb, rl, qb, ql in zip((0.6, 0.3), r_base, r_lora, q_base, q_lora):
-    print(f"{s:>6} {cos(ql - qb, rl - rb):>11.4f} {rel(ql - qb, rl - rb):>14.4f} {rel(rl, rb):>19.4f} "
-          f"{rel(ql, rl):>23.4f}", flush=True)
+    print(
+        f"{s:>6} {cos(ql - qb, rl - rb):>11.4f} {rel(ql - qb, rl - rb):>14.4f} {rel(rl, rb):>19.4f} "
+        f"{rel(ql, rl):>23.4f}",
+        flush=True,
+    )
 
 vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(args.vae))
 extra = {"pooled_output": pooled} if pooled is not None else {}
@@ -115,14 +121,18 @@ latent = torch.zeros(latent_shape)
 noise = comfy.sample.prepare_noise(latent, 0)
 images = {}
 for name, model in (("bf16", ref), ("bf16+lora", ref_l), ("ours", ours), ("ours+lora", ours_l)):
-    samples = comfy.sample.sample(model, noise, args.steps, 1.0, "euler", "simple", positive, negative, latent,
-                                  disable_pbar=True, seed=0)
+    samples = comfy.sample.sample(
+        model, noise, args.steps, 1.0, "euler", "simple", positive, negative, latent, disable_pbar=True, seed=0
+    )
     with torch.no_grad():
         images[name] = (vae.decode(samples)[0].detach().float().clamp(0, 1).cpu().numpy() * 255).round()
 psnr = lambda a, b: 10 * np.log10(255**2 / ((a - b) ** 2).mean())  # noqa: E731
-print(f"end to end: PSNR ours+LoRA vs bf16+LoRA {psnr(images['ours+lora'], images['bf16+lora']):.2f} dB "
-      f"(without LoRA: {psnr(images['ours'], images['bf16']):.2f} dB; LoRA vs no LoRA, bf16: "
-      f"{psnr(images['bf16+lora'], images['bf16']):.2f} dB)", flush=True)
+print(
+    f"end to end: PSNR ours+LoRA vs bf16+LoRA {psnr(images['ours+lora'], images['bf16+lora']):.2f} dB "
+    f"(without LoRA: {psnr(images['ours'], images['bf16']):.2f} dB; LoRA vs no LoRA, bf16: "
+    f"{psnr(images['bf16+lora'], images['bf16']):.2f} dB)",
+    flush=True,
+)
 if args.out:
     from PIL import Image
 

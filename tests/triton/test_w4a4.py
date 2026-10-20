@@ -17,9 +17,7 @@ w4a4 = load_kernels("gemm_w4a4")
 DTYPES = [torch.float16, torch.bfloat16]
 
 # e2m1 code -> value, matching _decode_e2m1
-E2M1 = torch.tensor(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
-)
+E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
 
 
 def unpack(packed: torch.Tensor, K: int) -> torch.Tensor:
@@ -96,9 +94,7 @@ def test_gemm_w4a4_int8_dot_matches_int32_reference(act_unsigned):
     ascales = (torch.rand(K // group, M, device="cuda") * 0.05 + 0.01).to(torch.float32)
     wscales = (torch.rand(K // group, N, device="cuda") * 0.05 + 0.01).to(torch.float32)
 
-    out = w4a4.gemm_w4a4(
-        act, wgt, ascales=ascales, wscales=wscales, act_unsigned=act_unsigned, out_dtype=torch.float32
-    )
+    out = w4a4.gemm_w4a4(act, wgt, ascales=ascales, wscales=wscales, act_unsigned=act_unsigned, out_dtype=torch.float32)
 
     a_codes = unpack(act, K).to(torch.int32)
     w_codes = unpack(wgt, K).to(torch.int32)
@@ -145,8 +141,14 @@ def test_gemm_w4a4_bias_lora(dtype):
     lora_up = torch.randn(N, R, dtype=dtype, device="cuda") * 0.1
 
     out = w4a4.gemm_w4a4(
-        act, wgt, ascales=ascales, wscales=wscales, bias=bias,
-        lora_act_in=lora_act, lora_up=lora_up, out_dtype=dtype,
+        act,
+        wgt,
+        ascales=ascales,
+        wscales=wscales,
+        bias=bias,
+        lora_act_in=lora_act,
+        lora_up=lora_up,
+        out_dtype=dtype,
     )
 
     a = dequant(act, ascales, K, group, fp4=False)
@@ -166,8 +168,14 @@ def test_gemm_w4a4_wcscales_alpha(dtype):
     alpha = 0.75
 
     out = w4a4.gemm_w4a4(
-        act, wgt, ascales=ascales, wscales=wscales, wcscales=wcscales,
-        alpha=alpha, fp4=True, out_dtype=dtype,
+        act,
+        wgt,
+        ascales=ascales,
+        wscales=wscales,
+        wcscales=wcscales,
+        alpha=alpha,
+        fp4=True,
+        out_dtype=dtype,
     )
 
     a = dequant(act, ascales, K, group, fp4=True)
@@ -238,7 +246,7 @@ def test_attention_fp16(dtype, B, H, TQ, TKV, D):
     v = torch.randn(B, H, TKV, D, dtype=dtype, device="cuda")
     o = torch.empty(B, TQ, H * D, dtype=dtype, device="cuda")
 
-    scale = D ** -0.5
+    scale = D**-0.5
     attention.attention_fp16(q, k, v, o, scale)
 
     ref = torch.nn.functional.scaled_dot_product_attention(q.float(), k.float(), v.float(), scale=scale)
@@ -272,8 +280,14 @@ def test_gemm_w4a4_rmsnorm_rope(dtype, B, H, T):
     rotary_emb = torch.stack([torch.sin(theta), torch.cos(theta)], dim=-1).reshape(M, HEAD_DIM // 2, 1, 2).float()
 
     out = w4a4.gemm_w4a4(
-        act, wgt, ascales=ascales, wscales=wscales,
-        norm_q=norm_q, norm_k=norm_k, rotary_emb=rotary_emb, out_dtype=dtype,
+        act,
+        wgt,
+        ascales=ascales,
+        wscales=wscales,
+        norm_q=norm_q,
+        norm_k=norm_k,
+        rotary_emb=rotary_emb,
+        out_dtype=dtype,
     )
 
     a = dequant(act, ascales, K, group, fp4=False)
@@ -326,15 +340,21 @@ def test_gemm_w4a4_fused_next_layer_quant(dtype, fp4, R2):
 
     qout = torch.empty(M, N // 2, dtype=torch.uint8, device="cuda")
     qgroup = 16 if fp4 else 64
-    oscales = torch.empty(
-        N // qgroup, M, dtype=torch.float8_e4m3fn if fp4 else dtype, device="cuda"
-    )
+    oscales = torch.empty(N // qgroup, M, dtype=torch.float8_e4m3fn if fp4 else dtype, device="cuda")
     lora_act_out = torch.empty(M, R2, dtype=torch.float32, device="cuda")
 
     w4a4.gemm_w4a4(
-        act, wgt, ascales=ascales, wscales=wscales, fp4=fp4,
-        qout=qout, oscales=oscales, smooth_factor=smooth,
-        lora_down=lora_down, lora_act_out=lora_act_out, out_dtype=dtype,
+        act,
+        wgt,
+        ascales=ascales,
+        wscales=wscales,
+        fp4=fp4,
+        qout=qout,
+        oscales=oscales,
+        smooth_factor=smooth,
+        lora_down=lora_down,
+        lora_act_out=lora_act_out,
+        out_dtype=dtype,
     )
 
     a = dequant(act, ascales, K, group, fp4=fp4)

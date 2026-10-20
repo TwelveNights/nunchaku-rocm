@@ -113,7 +113,9 @@ def gemm_fp16(
         out = torch.empty(M, N, dtype=weight.dtype, device=input.device)
     out2d = out.reshape(-1, N)
 
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
+    def grid(META):
+        return (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
+
     _gemm_fp16_kernel[grid](
         input2d,
         weight,

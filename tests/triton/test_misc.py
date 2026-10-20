@@ -53,8 +53,16 @@ def test_mul_add_no_scale(dtype):
 def test_mul_add_batch(dtype, batch_scale, batch_bias):
     B, M, N = 4, 32, 256
     x = torch.randn(B, M, N, dtype=dtype, device="cuda")
-    scale = torch.randn(B, 1, N, dtype=dtype, device="cuda") if batch_scale else torch.randn(1, N, dtype=dtype, device="cuda")
-    bias = torch.randn(B, 1, N, dtype=dtype, device="cuda") if batch_bias else torch.randn(1, N, dtype=dtype, device="cuda")
+    scale = (
+        torch.randn(B, 1, N, dtype=dtype, device="cuda")
+        if batch_scale
+        else torch.randn(1, N, dtype=dtype, device="cuda")
+    )
+    bias = (
+        torch.randn(B, 1, N, dtype=dtype, device="cuda")
+        if batch_bias
+        else torch.randn(1, N, dtype=dtype, device="cuda")
+    )
     shift = 1.0
 
     ref = x * (scale + shift) + bias
@@ -195,5 +203,7 @@ def test_layernorm_general(dtype, affine):
     b = torch.randn(hidden, dtype=dtype, device="cuda") if affine else None
     out = torch.empty_like(x)
     layernorm.layernorm_general(out, x, w, b, 1e-6)
-    ref = torch.nn.functional.layer_norm(x.float(), (hidden,), w.float() if affine else None, b.float() if affine else None, 1e-6)
+    ref = torch.nn.functional.layer_norm(
+        x.float(), (hidden,), w.float() if affine else None, b.float() if affine else None, 1e-6
+    )
     torch.testing.assert_close(out.float(), ref, rtol=3e-2, atol=3e-2)

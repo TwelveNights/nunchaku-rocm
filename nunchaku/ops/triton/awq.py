@@ -157,11 +157,14 @@ def _awq_gemv_g64_kernel(
     acc = tl.zeros((BLOCK_N,), tl.float32)
     x_row = x_ptr + row * stride_xm
     for c in tl.range(0, K // 64):
-        raw = tl.load(
-            b_ptr + offs_a[:, None] * stride_bn + c * 64 + offs_e[None, :],
-            mask=(offs_a[:, None] < N // 4),
-            other=0,
-        ).to(tl.int32) & 0xFFFF
+        raw = (
+            tl.load(
+                b_ptr + offs_a[:, None] * stride_bn + c * 64 + offs_e[None, :],
+                mask=(offs_a[:, None] < N // 4),
+                other=0,
+            ).to(tl.int32)
+            & 0xFFFF
+        )
         raw = tl.reshape(raw, (BLOCK_N, 16))  # rows: n = 4a + b, cols: d
         base = x_row + c * 64
         x0 = tl.load(base + xk).to(tl.float32)

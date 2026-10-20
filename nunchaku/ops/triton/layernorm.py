@@ -146,7 +146,9 @@ def rms_norm_general(
 
 
 @triton.jit
-def _layernorm_kernel(out_ptr, in_ptr, w_ptr, b_ptr, eps, hidden, HAS_W: tl.constexpr, HAS_B: tl.constexpr, BLOCK: tl.constexpr):
+def _layernorm_kernel(
+    out_ptr, in_ptr, w_ptr, b_ptr, eps, hidden, HAS_W: tl.constexpr, HAS_B: tl.constexpr, BLOCK: tl.constexpr
+):
     row = tl.program_id(0).to(tl.int64)
 
     s = tl.zeros((BLOCK,), tl.float32)

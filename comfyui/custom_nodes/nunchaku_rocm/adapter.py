@@ -57,6 +57,7 @@ class NunchakuFluxAdapter(Flux):
 
     def _apply_loras(self, requested: tuple) -> None:
         import comfy.utils
+
         from nunchaku.lora.runtime import load_lora, lora_model_info, set_loras
 
         info = lora_model_info(self.transformer)

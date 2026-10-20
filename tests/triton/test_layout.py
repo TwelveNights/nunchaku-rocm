@@ -96,8 +96,13 @@ def test_convert_svdq_linear_to_natural_layout():
     in_features, out_features, rank = 256, 128, 32
 
     lin = SVDQW4A4Linear(
-        in_features, out_features, rank=rank, bias=True, precision="int4",
-        torch_dtype=torch.bfloat16, device=device,
+        in_features,
+        out_features,
+        rank=rank,
+        bias=True,
+        precision="int4",
+        torch_dtype=torch.bfloat16,
+        device=device,
     )
     packer = NunchakuWeightPacker(bits=4)
     n, k, group = out_features, in_features, lin.group_size
@@ -125,12 +130,8 @@ def test_convert_svdq_linear_to_natural_layout():
     torch.testing.assert_close(lin.smooth_factor.data.float(), smooth_logical.float())
     torch.testing.assert_close(lin.proj_down.data.float(), proj_down_logical.float())
     torch.testing.assert_close(lin.proj_up.data.float(), proj_up_logical.float())
-    torch.testing.assert_close(
-        lin.wscales.data.float(), scale_logical.transpose(0, 1).float(), rtol=2e-2, atol=2e-2
-    )
-    torch.testing.assert_close(
-        _dequant_packed_nibbles(lin.qweight.data, k, group, unsigned=True), q_logical.float()
-    )
+    torch.testing.assert_close(lin.wscales.data.float(), scale_logical.transpose(0, 1).float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(_dequant_packed_nibbles(lin.qweight.data, k, group, unsigned=True), q_logical.float())
 
     x = torch.randn(8, in_features, dtype=torch.bfloat16, device=device)
     quantized_x, ascales, lora_act = lin.quantize(x)

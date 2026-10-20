@@ -536,9 +536,7 @@ class NunchakuFluxTransformer2DModelV2(FluxTransformer2DModel, NunchakuModelLoad
             # and has no BLOCK_M-multiple padding requirement.
             rotary_emb_txt = rotary_emb_txt.reshape(txt_tokens, *rotary_emb_txt.shape[2:])
             rotary_emb_img = rotary_emb_img.reshape(img_tokens, *rotary_emb_img.shape[2:])
-            rotary_emb_single = rotary_emb_single.reshape(
-                txt_tokens + img_tokens, *rotary_emb_single.shape[2:]
-            )
+            rotary_emb_single = rotary_emb_single.reshape(txt_tokens + img_tokens, *rotary_emb_single.shape[2:])
         else:
             rotary_emb_txt = pack_rotemb(pad_tensor(rotary_emb_txt, 256, 1))
             rotary_emb_img = pack_rotemb(pad_tensor(rotary_emb_img, 256, 1))

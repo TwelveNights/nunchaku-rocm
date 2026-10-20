@@ -56,9 +56,9 @@ def unpack_weight(packed: torch.Tensor, n: int, k: int, bits: int = 4) -> torch.
     """
     packer = NunchakuWeightPacker(bits=bits)
     assert n % packer.mem_n == 0, f"n ({n}) must be divisible by mem_n ({packer.mem_n})"
-    assert k % (packer.mem_k * packer.num_k_unrolls) == 0, (
-        f"k ({k}) must be divisible by mem_k * num_k_unrolls ({packer.mem_k * packer.num_k_unrolls})"
-    )
+    assert (
+        k % (packer.mem_k * packer.num_k_unrolls) == 0
+    ), f"k ({k}) must be divisible by mem_k * num_k_unrolls ({packer.mem_k * packer.num_k_unrolls})"
     n_tiles, k_tiles = n // packer.mem_n, k // packer.mem_k
 
     # packed is (n, k * bits // 8) int8; the packer's last step was
@@ -152,9 +152,7 @@ def unpack_scale(packed: torch.Tensor, n: int, group_size: int, bits: int = 4, w
     return _unpack_scale_standard(packed, n, group_size, packer)
 
 
-def _unpack_scale_standard(
-    packed: torch.Tensor, n: int, group_size: int, packer: MmaWeightPackerBase
-) -> torch.Tensor:
+def _unpack_scale_standard(packed: torch.Tensor, n: int, group_size: int, packer: MmaWeightPackerBase) -> torch.Tensor:
     s_pack_size = min(max(packer.warp_n // packer.num_lanes, 2), 8)
     num_s_lanes = min(packer.num_lanes, packer.warp_n // s_pack_size)
     num_s_packs = packer.warp_n // (s_pack_size * num_s_lanes)
@@ -227,62 +225,62 @@ def _unpack_micro_scale(packed: torch.Tensor, n: int, group_size: int, packer: M
 
 def convert_svdq_linear_to_natural_layout(linear) -> None:
     """
-    Convert one :class:`~nunchaku.models.linear.SVDQW4A4Linear`'s parameters
-    in place from the CUDA kernel's mma-fragment checkpoint layout to the
-    natural layout the Triton ``gemm_w4a4`` kernel reads.
+        Convert one :class:`~nunchaku.models.linear.SVDQW4A4Linear`'s parameters
+        in place from the CUDA kernel's mma-fragment checkpoint layout to the
+        natural layout the Triton ``gemm_w4a4`` kernel reads.
 
-Converts ``qweight``, ``wscales``, ``bias``, ``smooth_factor``, and
-    ``wcscales`` -- confirmed fragment-packed on disk by direct comparison
-    against a real checkpoint (``nunchaku-ai/nunchaku-flux.1-schnell``): the
-    raw ``qkv_proj.bias`` differs element-for-element from a full-precision
-    reference model's equivalent bias only by a fixed permutation, and
-    :func:`unpack_scale` (``group_size=-1``) inverts that permutation exactly
-    (zero error). ``bias``/``smooth_factor``/``wcscales`` are read through the
-    same ``packed_wscale_t`` accessor as ``wscales`` in the CUDA kernel
-    (``src/kernels/zgemm/gemm_w4a4_launch_impl.cuh``), which is consistent
-    with them sharing its on-disk layout.
+    Converts ``qweight``, ``wscales``, ``bias``, ``smooth_factor``, and
+        ``wcscales`` -- confirmed fragment-packed on disk by direct comparison
+        against a real checkpoint (``nunchaku-ai/nunchaku-flux.1-schnell``): the
+        raw ``qkv_proj.bias`` differs element-for-element from a full-precision
+        reference model's equivalent bias only by a fixed permutation, and
+        :func:`unpack_scale` (``group_size=-1``) inverts that permutation exactly
+        (zero error). ``bias``/``smooth_factor``/``wcscales`` are read through the
+        same ``packed_wscale_t`` accessor as ``wscales`` in the CUDA kernel
+        (``src/kernels/zgemm/gemm_w4a4_launch_impl.cuh``), which is consistent
+        with them sharing its on-disk layout.
 
-``proj_down``/``proj_up`` are also fragment-packed, inverted via
-    :meth:`NunchakuWeightPacker.unpack_lowrank_weight` (a different, simpler
-    permutation than ``pack_weight``'s). Confirmed indirectly: a real
-    checkpoint's LoRA branch, added on top of the main dequantized GEMM path,
-    should reduce reconstruction error against the full-precision reference
-    weight (that's the LoRA branch's purpose); before this fix it increased
-    the error instead, and `unpack_lowrank_weight` visibly permutes the raw
-    tensor (it is not a no-op on real data).
+    ``proj_down``/``proj_up`` are also fragment-packed, inverted via
+        :meth:`NunchakuWeightPacker.unpack_lowrank_weight` (a different, simpler
+        permutation than ``pack_weight``'s). Confirmed indirectly: a real
+        checkpoint's LoRA branch, added on top of the main dequantized GEMM path,
+        should reduce reconstruction error against the full-precision reference
+        weight (that's the LoRA branch's purpose); before this fix it increased
+        the error instead, and `unpack_lowrank_weight` visibly permutes the raw
+        tensor (it is not a no-op on real data).
 
-    ``smooth_factor_orig`` is unused by the GEMM and left untouched.
+        ``smooth_factor_orig`` is unused by the GEMM and left untouched.
 
-    Idempotency: calling this twice on the same module would corrupt its
-    weights (the inverse of an inverse is the forward pack, not a no-op), so
-    callers must call this exactly once per loaded checkpoint, before any
-    forward pass.
+        Idempotency: calling this twice on the same module would corrupt its
+        weights (the inverse of an inverse is the forward pack, not a no-op), so
+        callers must call this exactly once per loaded checkpoint, before any
+        forward pass.
     """
     n, half_k = linear.qweight.shape
     k = half_k * 2
     bits = 4
 
     with torch.no_grad():
-        linear.qweight.data = unpack_weight_packed_nibbles(linear.qweight.data, n, k, bits=bits).to(torch.uint8).view(
-            torch.int8
+        linear.qweight.data = (
+            unpack_weight_packed_nibbles(linear.qweight.data, n, k, bits=bits).to(torch.uint8).view(torch.int8)
         )
-        linear.wscales.data = unpack_scale(
-            linear.wscales.data, n, group_size=linear.group_size, bits=bits
-        ).to(linear.wscales.dtype)
+        linear.wscales.data = unpack_scale(linear.wscales.data, n, group_size=linear.group_size, bits=bits).to(
+            linear.wscales.dtype
+        )
 
         if linear.bias is not None:
-            linear.bias.data = unpack_scale(
-                linear.bias.data.reshape(1, -1), n, group_size=-1, bits=bits
-            ).to(linear.bias.dtype)
+            linear.bias.data = unpack_scale(linear.bias.data.reshape(1, -1), n, group_size=-1, bits=bits).to(
+                linear.bias.dtype
+            )
 
         linear.smooth_factor.data = unpack_scale(
             linear.smooth_factor.data.reshape(1, -1), k, group_size=-1, bits=bits
         ).to(linear.smooth_factor.dtype)
 
         if linear.wcscales is not None:
-            linear.wcscales.data = unpack_scale(
-                linear.wcscales.data.reshape(1, -1), n, group_size=-1, bits=bits
-            ).to(linear.wcscales.dtype)
+            linear.wcscales.data = unpack_scale(linear.wcscales.data.reshape(1, -1), n, group_size=-1, bits=bits).to(
+                linear.wcscales.dtype
+            )
 
         packer = NunchakuWeightPacker(bits=bits)
         if linear.proj_down.numel() > 0:

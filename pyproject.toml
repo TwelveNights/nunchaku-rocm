@@ -22,7 +22,6 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
 ]
 dynamic = [ "version" ]
-urls.Upstream = "https://github.com/nunchaku-ai/nunchaku"
 dependencies = [
   "accelerate>=1.9",
   "diffusers>=0.36",
@@ -86,6 +85,7 @@ optional-dependencies.full = [
   "controlnet-aux",
   "image-gen-aux @ git+https://github.com/asomoza/image_gen_aux.git",
 ]
+urls.Upstream = "https://github.com/nunchaku-ai/nunchaku"
 
 [tool.setuptools.packages.find]
 include = [ "nunchaku", "nunchaku.*" ]

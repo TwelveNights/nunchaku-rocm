@@ -89,7 +89,9 @@ def _problem(M, N, K, dtype, seed=0, R=32, bias=True, unit=False):
 
 
 def _rows(M, actual_m):
-    return torch.tensor(sorted(set(range(min(64, actual_m))) | set(range(max(0, actual_m - 64), actual_m))), device="cuda")
+    return torch.tensor(
+        sorted(set(range(min(64, actual_m))) | set(range(max(0, actual_m - 64), actual_m))), device="cuda"
+    )
 
 
 def _ulp(x: torch.Tensor, dtype) -> torch.Tensor:
@@ -150,8 +152,19 @@ def test_qk_vs_triton_and_fp64(native_env, dtype, has_bias, M, N, K, actual_m):
     assert torch.equal(out, again), "not deterministic"
 
     native_env.setenv("NUNCHAKU_NATIVE_GEMM", "0")
-    tri = w4a4.gemm_w4a4(act, wgt, out=torch.empty_like(out), ascales=asc, wscales=wsc, bias=bias, lora_act_in=la,
-                         lora_up=lu, norm_q=nq, norm_k=nk, rotary_emb=rot)
+    tri = w4a4.gemm_w4a4(
+        act,
+        wgt,
+        out=torch.empty_like(out),
+        ascales=asc,
+        wscales=wsc,
+        bias=bias,
+        lora_act_in=la,
+        lora_up=lu,
+        norm_q=nq,
+        norm_k=nk,
+        rotary_emb=rot,
+    )
     rows = _rows(M, actual_m)
     ref = _qk64(_lin64(act, wgt, asc, wsc, bias, la, lu, rows), nq, nk, rot[rows])
     scale = ref.abs().max().item()
@@ -212,8 +225,20 @@ def test_gelu_quant_vs_triton_and_fp64(native_env, dtype, M, N, K):
             native.gemm_gelu_quant(act, wgt, asc, wsc, bias, la, lu, qout, osc, sm, ld, lao)
         else:
             native_env.setenv("NUNCHAKU_NATIVE_GEMM", "0")
-            w4a4.gemm_w4a4(act, wgt, ascales=asc, wscales=wsc, bias=bias, lora_act_in=la, lora_up=lu, qout=qout,
-                           oscales=osc, smooth_factor=sm, lora_down=ld, lora_act_out=lao)
+            w4a4.gemm_w4a4(
+                act,
+                wgt,
+                ascales=asc,
+                wscales=wsc,
+                bias=bias,
+                lora_act_in=la,
+                lora_up=lu,
+                qout=qout,
+                oscales=osc,
+                smooth_factor=sm,
+                lora_down=ld,
+                lora_act_out=lao,
+            )
         res.append((qout[:M], osc[:, :M], lao[:M]))
         assert (qout[M:] == 0).all(), "qout rows past M were written"
     assert all(torch.equal(a, b) for a, b in zip(res[0], res[1])), "not deterministic"
@@ -235,9 +260,11 @@ def test_gelu_quant_vs_triton_and_fp64(native_env, dtype, M, N, K):
     e_t = ((lt[rows].double() - lref).abs().max() / lref.abs().max()).item()
     assert e_n <= 1.05 * e_t + 1e-6, f"lora_act_out error: native {e_n:.3g} vs triton {e_t:.3g}"
     x2 = (x + SHIFT) / sm.double()
+
     def deq_err(c, s):  # noqa: E306
         d = c[rows].double().view(len(rows), N // 64, 64) * s[:, rows].T.double()[..., None]
         return ((d.reshape(len(rows), N) - x2).pow(2).mean().sqrt() / x2.pow(2).mean().sqrt()).item()
+
     assert deq_err(cn, sn) <= 1.001 * deq_err(ct, st)
 
 
@@ -253,8 +280,19 @@ def test_gelu_quant_ranks_and_options(native_env, R2, smooth):
     for use_native in (True, False):
         native_env.setenv("NUNCHAKU_NATIVE_GEMM", "1" if use_native else "0")
         qout, osc, lao = _gq_out(M, N, R2, dtype)
-        w4a4.gemm_w4a4(act, wgt, ascales=asc, wscales=wsc, lora_act_in=la, lora_up=lu, qout=qout, oscales=osc,
-                       smooth_factor=sm, lora_down=ld, lora_act_out=lao)
+        w4a4.gemm_w4a4(
+            act,
+            wgt,
+            ascales=asc,
+            wscales=wsc,
+            lora_act_in=la,
+            lora_up=lu,
+            qout=qout,
+            oscales=osc,
+            smooth_factor=sm,
+            lora_down=ld,
+            lora_act_out=lao,
+        )
         outs.append((qout, osc, lao))
     (qn, sn, ln), (qt, st, lt) = outs
     cn, ct = _unpack(qn[:M], False), _unpack(qt[:M], False)
@@ -285,8 +323,19 @@ def _qk_call(M=256, N=384, K=256, dtype=torch.bfloat16, rot_dtype=torch.float32)
     act, wgt, asc, wsc, bias, la, lu = _problem(M, N, K, dtype)
     nq, nk, rot = _qk_inputs(M, M, dtype)
     rot = rot.to(rot_dtype)
-    return lambda: w4a4.gemm_w4a4(act, wgt, ascales=asc, wscales=wsc, bias=bias, lora_act_in=la, lora_up=lu,
-                                  norm_q=nq, norm_k=nk, rotary_emb=rot, out_dtype=dtype)
+    return lambda: w4a4.gemm_w4a4(
+        act,
+        wgt,
+        ascales=asc,
+        wscales=wsc,
+        bias=bias,
+        lora_act_in=la,
+        lora_up=lu,
+        norm_q=nq,
+        norm_k=nk,
+        rotary_emb=rot,
+        out_dtype=dtype,
+    )
 
 
 def _gq_call(M=256, N=256, K=256, dtype=torch.bfloat16):
@@ -295,8 +344,20 @@ def _gq_call(M=256, N=256, K=256, dtype=torch.bfloat16):
     qout, osc, lao = _gq_out(M, N, 32, dtype, pad=0)
 
     def f():
-        w4a4.gemm_w4a4(act, wgt, ascales=asc, wscales=wsc, bias=bias, lora_act_in=la, lora_up=lu, qout=qout,
-                       oscales=osc, smooth_factor=sm, lora_down=ld, lora_act_out=lao)
+        w4a4.gemm_w4a4(
+            act,
+            wgt,
+            ascales=asc,
+            wscales=wsc,
+            bias=bias,
+            lora_act_in=la,
+            lora_up=lu,
+            qout=qout,
+            oscales=osc,
+            smooth_factor=sm,
+            lora_down=ld,
+            lora_act_out=lao,
+        )
         return qout.clone(), osc.clone(), lao.clone()
 
     return f
@@ -340,7 +401,8 @@ def test_dispatch_fused_not_on_other_archs(native_env):
 
 
 @pytest.mark.parametrize(
-    "case", ["qk_k128", "qk_rot_dtype", "gq_m16"],
+    "case",
+    ["qk_k128", "qk_rot_dtype", "gq_m16"],
 )
 def test_dispatch_fused_unsupported_falls_back(native_env, case):
     """Calls the native epilogues cannot take run on Triton (and give the Triton result)."""
@@ -397,8 +459,22 @@ def _swiglu_call(act, inter, asc, la, sm, ld, M, H, dtype, R2):
     lao = torch.empty(M + 16, R2, device="cuda")
     qout = torch.zeros(M + 16, H // 2, dtype=torch.uint8, device="cuda")
     osc = torch.empty(H // 64, M + 16, dtype=dtype, device="cuda")
-    r = w4a4.gemm_w4a4(act, wgt_i, ascales=asc, wscales=wsc_i, bias=b_i, lora_act_in=la, lora_up=lu_i, qout=qout,
-                       oscales=osc, smooth_factor=sm, lora_down=ld, lora_act_out=lao, out_dtype=dtype, fuse_swiglu=True)
+    r = w4a4.gemm_w4a4(
+        act,
+        wgt_i,
+        ascales=asc,
+        wscales=wsc_i,
+        bias=b_i,
+        lora_act_in=la,
+        lora_up=lu_i,
+        qout=qout,
+        oscales=osc,
+        smooth_factor=sm,
+        lora_down=ld,
+        lora_act_out=lao,
+        out_dtype=dtype,
+        fuse_swiglu=True,
+    )
     assert r is None
     return qout, osc, lao
 
@@ -439,9 +515,9 @@ def test_swiglu_quant_vs_unfused_and_fp64(native_env, dtype, M, N, K):
     act, (wgt, wsc, b, lu), inter, asc, la, sm, ld = _swiglu_problem(M, N, K, dtype)
     qn, sn, ln = _swiglu_call(act, inter, asc, la, sm, ld, M, H, dtype, R2)
     qn2, sn2, ln2 = _swiglu_call(act, inter, asc, la, sm, ld, M, H, dtype, R2)
-    assert torch.equal(qn, qn2) and torch.equal(sn[:, :M], sn2[:, :M]) and torch.equal(ln[:M], ln2[:M]), (
-        "not deterministic"
-    )
+    assert (
+        torch.equal(qn, qn2) and torch.equal(sn[:, :M], sn2[:, :M]) and torch.equal(ln[:M], ln2[:M])
+    ), "not deterministic"
     assert (qn[M:] == 0).all(), "qout rows past M were written"
     native_env.setenv("NUNCHAKU_NATIVE_GEMM", "0")
     qt, st, lt = _swiglu_call(act, inter, asc, la, sm, ld, M, H, dtype, R2)
@@ -451,11 +527,14 @@ def test_swiglu_quant_vs_unfused_and_fp64(native_env, dtype, M, N, K):
     y = torch.nn.functional.silu(lin[:, :H]) * lin[:, H:]
     lref = y @ ld.double()
     v = y / sm.double()
+
     def deq_err(q, s):  # noqa: E306
         c = _unpack(q[rows], True).double().view(len(rows), H // 64, 64) * s[:, rows].T.double()[..., None]
         return ((c.reshape(len(rows), H) - v).pow(2).mean().sqrt() / v.pow(2).mean().sqrt()).item()
+
     def lerr(l):  # noqa: E306, E741
         return ((l[rows].double() - lref).abs().max() / lref.abs().max()).item()
+
     d_n, d_t = deq_err(qn, sn), deq_err(qt, st)
     assert d_n <= 1.001 * d_t, f"dequantization error: native {d_n:.5f} vs unfused {d_t:.5f}"
     assert lerr(ln) <= 1.05 * lerr(lt) + 1e-6, f"lora_act_out error: native {lerr(ln):.3g} vs unfused {lerr(lt):.3g}"

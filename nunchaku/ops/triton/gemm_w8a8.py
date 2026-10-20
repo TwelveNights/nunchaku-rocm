@@ -118,7 +118,9 @@ def gemm_w8a8(
     N = wgt.shape[0]
     assert wgt.shape[1] == K
 
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
+    def grid(META):
+        return (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
+
     _gemm_w8a8_kernel[grid](
         act,
         wgt,
@@ -193,6 +195,4 @@ def quantize_w8a8_act(
     M, K = input.shape
     k_out = K // 2 if fuse_glu else K
     block = min(triton.next_power_of_2(k_out), 2048)
-    _quantize_w8a8_act_kernel[(M,)](
-        input, output, oscales.reshape(-1), K, k_out, FUSE_GLU=fuse_glu, BLOCK=block
-    )
+    _quantize_w8a8_act_kernel[(M,)](input, output, oscales.reshape(-1), K, k_out, FUSE_GLU=fuse_glu, BLOCK=block)

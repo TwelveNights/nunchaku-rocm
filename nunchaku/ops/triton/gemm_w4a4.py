@@ -306,12 +306,20 @@ def _gemm_w4a4_kernel(
         b_mask = offs_b < K // 2
 
         qa = _load_nibbles(
-            act_ptr, offs_m[:, None], offs_b[None, :], stride_am,
-            m_mask[:, None] & b_mask[None, :], GROUP_K // 2,
+            act_ptr,
+            offs_m[:, None],
+            offs_b[None, :],
+            stride_am,
+            m_mask[:, None] & b_mask[None, :],
+            GROUP_K // 2,
         )
         qw = _load_nibbles(
-            wgt_ptr, offs_n[:, None], offs_b[None, :], stride_wn,
-            n_mask[:, None] & b_mask[None, :], GROUP_K // 2,
+            wgt_ptr,
+            offs_n[:, None],
+            offs_b[None, :],
+            stride_wn,
+            n_mask[:, None] & b_mask[None, :],
+            GROUP_K // 2,
         )
 
         if USE_FP4:
@@ -342,8 +350,23 @@ def _gemm_w4a4_kernel(
         acc += dot * asc[:, None] * wsc[None, :]
 
     acc = _w4a4_epilogue(
-        acc, offs_m, offs_n, m_mask, n_mask, bias_ptr, lora_act_ptr, lora_up_ptr,
-        wcscale_ptr, R, alpha, stride_lam, stride_lun, HAS_BIAS, HAS_LORA, HAS_WCSCALE, FUSE_SILU,
+        acc,
+        offs_m,
+        offs_n,
+        m_mask,
+        n_mask,
+        bias_ptr,
+        lora_act_ptr,
+        lora_up_ptr,
+        wcscale_ptr,
+        R,
+        alpha,
+        stride_lam,
+        stride_lun,
+        HAS_BIAS,
+        HAS_LORA,
+        HAS_WCSCALE,
+        FUSE_SILU,
     )
 
     out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :]
@@ -489,7 +512,9 @@ def _qk_rmsnorm_rope_tile(acc, offs_m, row_mask, part, norm_q_ptr, norm_k_ptr, r
     rstd = tl.rsqrt(tl.sum(acc * acc, axis=1) / D + eps)
     x = acc * rstd[:, None] * w[None, :]
     # rotary_emb rows are [D // 2 pairs, (sin, cos)] fp32
-    sc = tl.load(rot_ptr + offs_m[:, None].to(tl.int64) * stride_rm + offs_d[None, :], mask=row_mask[:, None], other=0.0)
+    sc = tl.load(
+        rot_ptr + offs_m[:, None].to(tl.int64) * stride_rm + offs_d[None, :], mask=row_mask[:, None], other=0.0
+    )
     sin, cos = tl.split(tl.reshape(sc, (BM, D // 2, 2)))
     xe, xo = tl.split(tl.reshape(x, (BM, D // 2, 2)))
     rot = tl.reshape(tl.join(xe * cos - xo * sin, xe * sin + xo * cos), (BM, D))
@@ -552,17 +577,46 @@ def _gemm_w4a4_int4_kernel(
     n_mask = offs_n < N
     out_m_mask = offs_m < actual_m
     acc = _int4_mainloop(
-        act_ptr, wgt_ptr, ascale_ptr, wscale_ptr, offs_m % M, offs_n % N, K, stride_am, stride_wn, stride_asg, stride_wsg,
-        ACT_UNSIGNED, BLOCK_M, BLOCK_N,
+        act_ptr,
+        wgt_ptr,
+        ascale_ptr,
+        wscale_ptr,
+        offs_m % M,
+        offs_n % N,
+        K,
+        stride_am,
+        stride_wn,
+        stride_asg,
+        stride_wsg,
+        ACT_UNSIGNED,
+        BLOCK_M,
+        BLOCK_N,
     )
 
     acc = _w4a4_epilogue(
-        acc, offs_m, offs_n, m_mask, n_mask, bias_ptr, lora_act_ptr, lora_up_ptr,
-        wcscale_ptr, R, alpha, stride_lam, stride_lun, HAS_BIAS, HAS_LORA, HAS_WCSCALE, FUSE_SILU,
+        acc,
+        offs_m,
+        offs_n,
+        m_mask,
+        n_mask,
+        bias_ptr,
+        lora_act_ptr,
+        lora_up_ptr,
+        wcscale_ptr,
+        R,
+        alpha,
+        stride_lam,
+        stride_lun,
+        HAS_BIAS,
+        HAS_LORA,
+        HAS_WCSCALE,
+        FUSE_SILU,
     )
 
     if FUSE_QK_NORM:
-        acc = _qk_rmsnorm_rope_tile(acc, offs_m, out_m_mask, (pid_n * BLOCK_N) // (N // 3), norm_q_ptr, norm_k_ptr, rot_ptr, stride_rm, eps)
+        acc = _qk_rmsnorm_rope_tile(
+            acc, offs_m, out_m_mask, (pid_n * BLOCK_N) // (N // 3), norm_q_ptr, norm_k_ptr, rot_ptr, stride_rm, eps
+        )
 
     out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :]
     tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=out_m_mask[:, None] & n_mask[None, :])
@@ -632,12 +686,39 @@ def _gemm_w4a4_int4_gelu_quant_kernel(
     n_mask = offs_n < N
     out_m_mask = offs_m < actual_m
     acc = _int4_mainloop(
-        act_ptr, wgt_ptr, ascale_ptr, wscale_ptr, offs_m % M, offs_n % N, K, stride_am, stride_wn, stride_asg, stride_wsg,
-        ACT_UNSIGNED, BLOCK_M, BLOCK_N,
+        act_ptr,
+        wgt_ptr,
+        ascale_ptr,
+        wscale_ptr,
+        offs_m % M,
+        offs_n % N,
+        K,
+        stride_am,
+        stride_wn,
+        stride_asg,
+        stride_wsg,
+        ACT_UNSIGNED,
+        BLOCK_M,
+        BLOCK_N,
     )
     acc = _w4a4_epilogue(
-        acc, offs_m, offs_n, m_mask, n_mask, bias_ptr, lora_act_ptr, lora_up_ptr,
-        bias_ptr, R, 1.0, stride_lam, stride_lun, HAS_BIAS, HAS_LORA, False, False,
+        acc,
+        offs_m,
+        offs_n,
+        m_mask,
+        n_mask,
+        bias_ptr,
+        lora_act_ptr,
+        lora_up_ptr,
+        bias_ptr,
+        R,
+        1.0,
+        stride_lam,
+        stride_lun,
+        HAS_BIAS,
+        HAS_LORA,
+        False,
+        False,
     )
     if STORE_OUT:
         tl.store(
@@ -786,8 +867,23 @@ def _apply_rmsnorm_rope_qk(
 
 
 def _launch_gemm_int4_gelu_quant(
-    act, wgt, out2d, ascales, wscales, bias, lora_act_in, lora_up, qout, oscales, smooth, lora_down, lora_act_out,
-    act_unsigned, M, N, K,
+    act,
+    wgt,
+    out2d,
+    ascales,
+    wscales,
+    bias,
+    lora_act_in,
+    lora_up,
+    qout,
+    oscales,
+    smooth,
+    lora_down,
+    lora_act_out,
+    act_unsigned,
+    M,
+    N,
+    K,
 ):
     act32, wgt32 = act.view(torch.int32), wgt.view(torch.int32)
     qout2d = qout.reshape(-1, qout.shape[-1])
@@ -850,14 +946,33 @@ def _launch_gemm_int4_gelu_quant(
 
 
 def _gemm_w4a4_swiglu_quant(
-    act, wgt, ascales, wscales, bias, lora_act_in, lora_up, qout, oscales, smooth, lora_down, lora_act_out,
-    act_unsigned, out, wcscales, norm_q, rotary_emb, fuse_silu, fp4, alpha, out_dtype,
+    act,
+    wgt,
+    ascales,
+    wscales,
+    bias,
+    lora_act_in,
+    lora_up,
+    qout,
+    oscales,
+    smooth,
+    lora_down,
+    lora_act_out,
+    act_unsigned,
+    out,
+    wcscales,
+    norm_q,
+    rotary_emb,
+    fuse_silu,
+    fp4,
+    alpha,
+    out_dtype,
 ) -> None:
     """``gemm_w4a4(..., fuse_swiglu=True)``: the native fused kernel on gfx11, else the unfused equivalent."""
     assert out is None and qout is not None and oscales is not None, "fuse_swiglu writes qout/oscales, not out"
-    assert not (fp4 or fuse_silu or wcscales is not None or norm_q is not None or rotary_emb is not None), (
-        "fuse_swiglu is int4-only and excludes the other epilogues"
-    )
+    assert not (
+        fp4 or fuse_silu or wcscales is not None or norm_q is not None or rotary_emb is not None
+    ), "fuse_swiglu is int4-only and excludes the other epilogues"
     assert alpha is None or alpha == 1.0
     assert (lora_down is None) == (lora_act_out is None), "lora_down and lora_act_out must be given together"
     M, N = act.shape[0], wgt.shape[0]
@@ -869,8 +984,17 @@ def _gemm_w4a4_swiglu_quant(
     ):
         return
     # unfused: the GEMM (interleaved columns), Flux2SwiGLU on the 16-bit output, the activation quantizer
-    x = gemm_w4a4(act, wgt, ascales=ascales, wscales=wscales, bias=bias, lora_act_in=la, lora_up=lu,
-                  act_unsigned=act_unsigned, out_dtype=out_dtype)
+    x = gemm_w4a4(
+        act,
+        wgt,
+        ascales=ascales,
+        wscales=wscales,
+        bias=bias,
+        lora_act_in=la,
+        lora_up=lu,
+        act_unsigned=act_unsigned,
+        out_dtype=out_dtype,
+    )
     x = x.view(M, N // 32, 2, 16)
     y = (torch.nn.functional.silu(x[:, :, 0]) * x[:, :, 1]).reshape(M, N // 2)
     _launch_quantize(y, qout2d, oscales, lora_down, lora_act_out, smooth, fuse_glu=False, fp4=False)
@@ -949,9 +1073,27 @@ def gemm_w4a4(
 
     if fuse_swiglu:
         _gemm_w4a4_swiglu_quant(
-            act.reshape(-1, act.shape[-1]), wgt, ascales, wscales, bias, lora_act_in, lora_up, qout, oscales,
-            smooth_factor, lora_down, lora_act_out, act_unsigned, out, wcscales, norm_q, rotary_emb, fuse_silu, fp4,
-            alpha, out_dtype,
+            act.reshape(-1, act.shape[-1]),
+            wgt,
+            ascales,
+            wscales,
+            bias,
+            lora_act_in,
+            lora_up,
+            qout,
+            oscales,
+            smooth_factor,
+            lora_down,
+            lora_act_out,
+            act_unsigned,
+            out,
+            wcscales,
+            norm_q,
+            rotary_emb,
+            fuse_silu,
+            fp4,
+            alpha,
+            out_dtype,
         )
         return None
 
@@ -1023,26 +1165,55 @@ def gemm_w4a4(
             return out
     elif fuse_quant:
         if _native_w4a4.try_gemm_gelu_quant(
-            act, wgt, out2d, ascales, wscales, bias, la_n, lu_n, qout.reshape(-1, qout.shape[-1]), oscales,
-            smooth_factor, lora_down, lora_act_out, act_unsigned,
+            act,
+            wgt,
+            out2d,
+            ascales,
+            wscales,
+            bias,
+            la_n,
+            lu_n,
+            qout.reshape(-1, qout.shape[-1]),
+            oscales,
+            smooth_factor,
+            lora_down,
+            lora_act_out,
+            act_unsigned,
         ):
             return out
 
     if fuse_quant:
         _launch_gemm_int4_gelu_quant(
-            act, wgt, out2d, ascales, wscales, bias, lora_act_in if has_lora else None, lora_up if has_lora else None,
-            qout, oscales, smooth_factor, lora_down, lora_act_out, act_unsigned, M, N, K,
+            act,
+            wgt,
+            out2d,
+            ascales,
+            wscales,
+            bias,
+            lora_act_in if has_lora else None,
+            lora_up if has_lora else None,
+            qout,
+            oscales,
+            smooth_factor,
+            lora_down,
+            lora_act_out,
+            act_unsigned,
+            M,
+            N,
+            K,
         )
         return out
 
     # the K loop steps exactly one scale group at a time, so a group is never
     # straddled for either int4 (64) or nvfp4 (16)
 
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
+    def grid(META):
+        return (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
+
     if want_qk:
-        assert norm_q is not None and norm_k is not None and rotary_emb is not None, (
-            "norm_q, norm_k, and rotary_emb must all be given together"
-        )
+        assert (
+            norm_q is not None and norm_k is not None and rotary_emb is not None
+        ), "norm_q, norm_k, and rotary_emb must all be given together"
     fuse_qk = word_ok and want_qk and (N % 3 == 0) and ((N // 3) % HEAD_DIM == 0) and rotary_emb.dtype == torch.float32
     if fuse_qk:
         rot = rotary_emb.reshape(actual_m, HEAD_DIM)
@@ -1141,8 +1312,6 @@ def gemm_w4a4(
         )
 
     return out
-
-
 
 
 @triton.jit

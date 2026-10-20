@@ -142,7 +142,9 @@ def attention_fp16(
     # exp2-based softmax: fold log2(e) into the scale
     scale = scale * 1.4426950408889634
 
-    grid = lambda META: (triton.cdiv(N_CTX_Q, META["BLOCK_M"]), H, B)
+    def grid(META):
+        return (triton.cdiv(N_CTX_Q, META["BLOCK_M"]), H, B)
+
     _attention_kernel[grid](
         q,
         k,

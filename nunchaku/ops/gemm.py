@@ -145,8 +145,7 @@ def svdq_gemm_w4a4_cuda(
         active = sorted(name for name, value in unsupported.items() if value is not None)
         if active:
             raise NotImplementedError(
-                "The Triton backend does not implement these fused gemm_w4a4 epilogues yet: "
-                + ", ".join(active)
+                "The Triton backend does not implement these fused gemm_w4a4 epilogues yet: " + ", ".join(active)
             )
 
         _gemm_w4a4(

@@ -116,11 +116,12 @@ class _QKArgs(ctypes.Structure):
 class _GQArgs(ctypes.Structure):
     """Mirror of ``QuantArgs`` (GeluQuantEpilogue / SwigluQuantEpilogue)."""
 
-    _fields_ = [
-        (name, ctypes.c_void_p) for name in ("qout", "oscales", "smooth", "lora_down", "lora_part")
-    ] + [("stride_lop", ctypes.c_longlong)] + [
-        (name, ctypes.c_int) for name in ("R2", "stride_qm", "stride_osg", "stride_ld", "stride_lom")
-    ] + [("shift", ctypes.c_float)]
+    _fields_ = (
+        [(name, ctypes.c_void_p) for name in ("qout", "oscales", "smooth", "lora_down", "lora_part")]
+        + [("stride_lop", ctypes.c_longlong)]
+        + [(name, ctypes.c_int) for name in ("R2", "stride_qm", "stride_osg", "stride_ld", "stride_lom")]
+        + [("shift", ctypes.c_float)]
+    )
 
 
 def mode() -> str:
@@ -282,7 +283,9 @@ def unsupported_reason_gelu_quant(
         return f"oscales shape {tuple(oscales.shape)}"
     if oscales.device != dev:
         return "tensors on different devices"
-    if smooth is not None and (smooth.dtype != T or smooth.numel() != N or not smooth.is_contiguous() or smooth.device != dev):
+    if smooth is not None and (
+        smooth.dtype != T or smooth.numel() != N or not smooth.is_contiguous() or smooth.device != dev
+    ):
         return "smooth_factor must be a contiguous (N,) tensor of the output dtype"
     if (lora_down is None) != (lora_act_out is None):
         return "lora_down and lora_act_out must be given together"
@@ -325,7 +328,9 @@ def unsupported_reason_swiglu_quant(
         return f"oscales shape {tuple(oscales.shape)}"
     if oscales.device != dev:
         return "tensors on different devices"
-    if smooth is not None and (smooth.dtype != T or smooth.numel() != H or not smooth.is_contiguous() or smooth.device != dev):
+    if smooth is not None and (
+        smooth.dtype != T or smooth.numel() != H or not smooth.is_contiguous() or smooth.device != dev
+    ):
         return "smooth_factor must be a contiguous (H,) tensor of the output dtype"
     if (lora_down is None) != (lora_act_out is None):
         return "lora_down and lora_act_out must be given together"
@@ -420,15 +425,48 @@ class _Kernels:
         g = self._gemm_args(act, wgt, out, ascales, wscales, bias, lora_act, lora_up)
         self._run("w4a4", out.dtype, act_unsigned, tile or pick_tile(M, N), M, N, (g,))
 
-    def launch_qk(self, act, wgt, out, ascales, wscales, bias, lora_act, lora_up, norm_q, norm_k, rot, act_unsigned,
-                  eps=1e-6, tile=None) -> None:
+    def launch_qk(
+        self,
+        act,
+        wgt,
+        out,
+        ascales,
+        wscales,
+        bias,
+        lora_act,
+        lora_up,
+        norm_q,
+        norm_k,
+        rot,
+        act_unsigned,
+        eps=1e-6,
+        tile=None,
+    ) -> None:
         M, N = act.shape[0], wgt.shape[0]
         g = self._gemm_args(act, wgt, out, ascales, wscales, bias, lora_act, lora_up)
         e = _QKArgs(norm_q.data_ptr(), norm_k.data_ptr(), rot.data_ptr(), rot.stride(0), eps)
         self._run("w4a4qk", out.dtype, act_unsigned, tile or QK_TILES[0], M, N, (g, e))
 
-    def launch_gelu_quant(self, act, wgt, out, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth,
-                          lora_down, lora_act_out, act_unsigned, shift=GELU_SHIFT, tile=None, name="w4a4gq") -> None:
+    def launch_gelu_quant(
+        self,
+        act,
+        wgt,
+        out,
+        ascales,
+        wscales,
+        bias,
+        lora_act,
+        lora_up,
+        qout,
+        oscales,
+        smooth,
+        lora_down,
+        lora_act_out,
+        act_unsigned,
+        shift=GELU_SHIFT,
+        tile=None,
+        name="w4a4gq",
+    ) -> None:
         M, N = act.shape[0], wgt.shape[0]
         tile = tile or GQ_TILES[0]
         bn = tile[1]
@@ -455,10 +493,42 @@ class _Kernels:
         if R2:
             torch.sum(part, dim=0, out=lora_act_out[:M])
 
-    def launch_swiglu_quant(self, act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth,
-                            lora_down, lora_act_out, act_unsigned, tile=None) -> None:
-        self.launch_gelu_quant(act, wgt, None, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth,
-                               lora_down, lora_act_out, act_unsigned, 0.0, tile or SQ_TILES[0], "w4a4sq")
+    def launch_swiglu_quant(
+        self,
+        act,
+        wgt,
+        ascales,
+        wscales,
+        bias,
+        lora_act,
+        lora_up,
+        qout,
+        oscales,
+        smooth,
+        lora_down,
+        lora_act_out,
+        act_unsigned,
+        tile=None,
+    ) -> None:
+        self.launch_gelu_quant(
+            act,
+            wgt,
+            None,
+            ascales,
+            wscales,
+            bias,
+            lora_act,
+            lora_up,
+            qout,
+            oscales,
+            smooth,
+            lora_down,
+            lora_act_out,
+            act_unsigned,
+            0.0,
+            tile or SQ_TILES[0],
+            "w4a4sq",
+        )
 
     def _self_test(self) -> None:
         """Run every kernel once on a small odd-shaped problem and compare with a torch reference."""
@@ -512,14 +582,31 @@ class _Kernels:
                     qout = torch.zeros(M + 16, H // 2, dtype=torch.uint8, device=dev)
                     osc = torch.empty(H // 64, M, dtype=dtype, device=dev)
                     lao = torch.empty(M, R2, device=dev)
-                    self.launch_swiglu_quant(act, wgt[idx], asc, wsc[:, idx].contiguous(), bias[idx], lora_act,
-                                             lora_up[idx], qout, osc, smooth, lora_down, lao, unsigned, tile=tile)
+                    self.launch_swiglu_quant(
+                        act,
+                        wgt[idx],
+                        asc,
+                        wsc[:, idx].contiguous(),
+                        bias[idx],
+                        lora_act,
+                        lora_up[idx],
+                        qout,
+                        osc,
+                        smooth,
+                        lora_down,
+                        lao,
+                        unsigned,
+                        tile=tile,
+                    )
                     codes = _unpack(qout[:M], True)
                     bad = [
                         what
                         for what, ok in (
                             ("oscales", ((osc.float() - s_ref).abs() <= 1e-2 * s_ref.abs() + 1e-6).all().item()),
-                            ("codes", (codes - q_ref).abs().max().item() <= 1 and (codes != q_ref).float().mean() < 1e-2),
+                            (
+                                "codes",
+                                (codes - q_ref).abs().max().item() <= 1 and (codes != q_ref).float().mean() < 1e-2,
+                            ),
                             ("lora_act_out", (lao - l_ref).abs().max().item() <= 1e-2 * l_ref.abs().max().item()),
                             ("rows past M", (qout[M:] == 0).all().item()),
                         )
@@ -543,11 +630,14 @@ class _Kernels:
             nq = (torch.rand(HEAD_DIM, device=dev, generator=g) + 0.5).to(dtype)
             nk = (torch.rand(HEAD_DIM, device=dev, generator=g) + 0.5).to(dtype)
             for unsigned in (False, True):
-                ref = reference_qk(reference(act, wgt, asc, wsc, bias, lora_act, lora_up, unsigned)[:actual_m], nq, nk, rot)
+                ref = reference_qk(
+                    reference(act, wgt, asc, wsc, bias, lora_act, lora_up, unsigned)[:actual_m], nq, nk, rot
+                )
                 for tile in QK_TILES:
                     buf = torch.full((actual_m + 8, N), float("nan"), dtype=dtype, device=dev)
-                    self.launch_qk(act, wgt, buf[:actual_m], asc, wsc, bias, lora_act, lora_up, nq, nk, rot, unsigned,
-                                   tile=tile)
+                    self.launch_qk(
+                        act, wgt, buf[:actual_m], asc, wsc, bias, lora_act, lora_up, nq, nk, rot, unsigned, tile=tile
+                    )
                     err = (buf[:actual_m].float() - ref).abs().max().item()
                     tol = 1e-2 * ref.abs().max().item()
                     if not err <= tol or not bool(buf[actual_m:].isnan().all()):
@@ -578,15 +668,33 @@ class _Kernels:
                     qout = torch.zeros(M + 16, N // 2, dtype=torch.uint8, device=dev)
                     osc = torch.empty(N // 64, M, dtype=dtype, device=dev)
                     lao = torch.empty(M, R2, device=dev)
-                    self.launch_gelu_quant(act, wgt, out, asc, wsc, bias, lora_act, lora_up, qout, osc, smooth,
-                                           lora_down, lao, unsigned, tile=tile)
+                    self.launch_gelu_quant(
+                        act,
+                        wgt,
+                        out,
+                        asc,
+                        wsc,
+                        bias,
+                        lora_act,
+                        lora_up,
+                        qout,
+                        osc,
+                        smooth,
+                        lora_down,
+                        lao,
+                        unsigned,
+                        tile=tile,
+                    )
                     codes = _unpack(qout[:M], False)
                     bad = [
                         what
                         for what, ok in (
                             ("out", (out.float() - lin).abs().max().item() <= 1e-2 * lin.abs().max().item()),
                             ("oscales", ((osc.float() - s_ref).abs() <= 1e-2 * s_ref.abs() + 1e-6).all().item()),
-                            ("codes", (codes - q_ref).abs().max().item() <= 1 and (codes != q_ref).float().mean() < 1e-2),
+                            (
+                                "codes",
+                                (codes - q_ref).abs().max().item() <= 1 and (codes != q_ref).float().mean() < 1e-2,
+                            ),
                             ("lora_act_out", (lao - l_ref).abs().max().item() <= 1e-2 * l_ref.abs().max().item()),
                             ("rows past M", (qout[M:] == 0).all().item()),
                         )
@@ -724,8 +832,9 @@ def gemm(act, wgt, out, ascales, wscales, bias=None, lora_act=None, lora_up=None
     return out
 
 
-def gemm_qk(act, wgt, out, ascales, wscales, bias, lora_act, lora_up, norm_q, norm_k, rotary_emb,
-            act_unsigned=False, tile=None):
+def gemm_qk(
+    act, wgt, out, ascales, wscales, bias, lora_act, lora_up, norm_q, norm_k, rotary_emb, act_unsigned=False, tile=None
+):
     """
     The native GEMM with the fused Q/K RMSNorm + RoPE epilogue, directly (raises
     if unsupported). ``rotary_emb``: (actual_m, 64, 1, 2) or (actual_m, 128) fp32.
@@ -740,8 +849,23 @@ def gemm_qk(act, wgt, out, ascales, wscales, bias, lora_act, lora_up, norm_q, no
     return out
 
 
-def gemm_gelu_quant(act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down,
-                    lora_act_out, act_unsigned=False, out=None, tile=None):
+def gemm_gelu_quant(
+    act,
+    wgt,
+    ascales,
+    wscales,
+    bias,
+    lora_act,
+    lora_up,
+    qout,
+    oscales,
+    smooth,
+    lora_down,
+    lora_act_out,
+    act_unsigned=False,
+    out=None,
+    tile=None,
+):
     """The native GEMM with the fused GELU + LoRA-down + int4 quantization epilogue, directly (raises if unsupported)."""
     reason = unsupported_reason_gelu_quant(
         act, wgt, out, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down, lora_act_out
@@ -749,13 +873,40 @@ def gemm_gelu_quant(act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, o
     if reason is not None:
         raise ValueError(f"native W4A4 GELU-quant GEMM does not support this call: {reason}")
     _kernels(_device(act), force=True).launch_gelu_quant(
-        act, wgt, out, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down, lora_act_out,
-        act_unsigned, tile=tile,
+        act,
+        wgt,
+        out,
+        ascales,
+        wscales,
+        bias,
+        lora_act,
+        lora_up,
+        qout,
+        oscales,
+        smooth,
+        lora_down,
+        lora_act_out,
+        act_unsigned,
+        tile=tile,
     )
 
 
-def gemm_swiglu_quant(act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down,
-                      lora_act_out, act_unsigned=False, tile=None):
+def gemm_swiglu_quant(
+    act,
+    wgt,
+    ascales,
+    wscales,
+    bias,
+    lora_act,
+    lora_up,
+    qout,
+    oscales,
+    smooth,
+    lora_down,
+    lora_act_out,
+    act_unsigned=False,
+    tile=None,
+):
     """The native GEMM with the fused SwiGLU + LoRA-down + signed int4 quantization epilogue, directly."""
     reason = unsupported_reason_swiglu_quant(
         act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down, lora_act_out
@@ -763,8 +914,20 @@ def gemm_swiglu_quant(act, wgt, ascales, wscales, bias, lora_act, lora_up, qout,
     if reason is not None:
         raise ValueError(f"native W4A4 SwiGLU-quant GEMM does not support this call: {reason}")
     _kernels(_device(act), force=True).launch_swiglu_quant(
-        act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down, lora_act_out,
-        act_unsigned, tile=tile,
+        act,
+        wgt,
+        ascales,
+        wscales,
+        bias,
+        lora_act,
+        lora_up,
+        qout,
+        oscales,
+        smooth,
+        lora_down,
+        lora_act_out,
+        act_unsigned,
+        tile=tile,
     )
 
 
@@ -815,39 +978,83 @@ def try_gemm(act, wgt, out, ascales, wscales, bias, lora_act, lora_up, act_unsig
     )
 
 
-def try_gemm_qk(act, wgt, out, ascales, wscales, bias, lora_act, lora_up, norm_q, norm_k, rotary_emb,
-                act_unsigned) -> bool:
+def try_gemm_qk(
+    act, wgt, out, ascales, wscales, bias, lora_act, lora_up, norm_q, norm_k, rotary_emb, act_unsigned
+) -> bool:
     """:func:`gemm_qk` if enabled and supported, else ``False`` (run Triton)."""
     rot = _rot2d(rotary_emb, out)
     return _try(
         act,
         lambda: unsupported_reason_qk(act, wgt, out, ascales, wscales, bias, lora_act, lora_up, norm_q, norm_k, rot),
-        lambda k: k.launch_qk(act, wgt, out, ascales, wscales, bias, lora_act, lora_up, norm_q, norm_k, rot,
-                              act_unsigned),
+        lambda k: k.launch_qk(
+            act, wgt, out, ascales, wscales, bias, lora_act, lora_up, norm_q, norm_k, rot, act_unsigned
+        ),
     )
 
 
-def try_gemm_gelu_quant(act, wgt, out, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down,
-                        lora_act_out, act_unsigned) -> bool:
+def try_gemm_gelu_quant(
+    act,
+    wgt,
+    out,
+    ascales,
+    wscales,
+    bias,
+    lora_act,
+    lora_up,
+    qout,
+    oscales,
+    smooth,
+    lora_down,
+    lora_act_out,
+    act_unsigned,
+) -> bool:
     """:func:`gemm_gelu_quant` if enabled and supported, else ``False`` (run Triton)."""
     return _try(
         act,
         lambda: unsupported_reason_gelu_quant(
             act, wgt, out, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down, lora_act_out
         ),
-        lambda k: k.launch_gelu_quant(act, wgt, out, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth,
-                                      lora_down, lora_act_out, act_unsigned),
+        lambda k: k.launch_gelu_quant(
+            act,
+            wgt,
+            out,
+            ascales,
+            wscales,
+            bias,
+            lora_act,
+            lora_up,
+            qout,
+            oscales,
+            smooth,
+            lora_down,
+            lora_act_out,
+            act_unsigned,
+        ),
     )
 
 
-def try_gemm_swiglu_quant(act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down,
-                          lora_act_out, act_unsigned) -> bool:
+def try_gemm_swiglu_quant(
+    act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down, lora_act_out, act_unsigned
+) -> bool:
     """:func:`gemm_swiglu_quant` if enabled and supported, else ``False`` (run Triton)."""
     return _try(
         act,
         lambda: unsupported_reason_swiglu_quant(
             act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down, lora_act_out
         ),
-        lambda k: k.launch_swiglu_quant(act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth,
-                                        lora_down, lora_act_out, act_unsigned),
+        lambda k: k.launch_swiglu_quant(
+            act,
+            wgt,
+            ascales,
+            wscales,
+            bias,
+            lora_act,
+            lora_up,
+            qout,
+            oscales,
+            smooth,
+            lora_down,
+            lora_act_out,
+            act_unsigned,
+        ),
     )

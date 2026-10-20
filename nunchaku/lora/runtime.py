@@ -156,7 +156,9 @@ def _diffusers_to_bfl(lora: dict[str, LoraWeight], dims: dict) -> dict[str, Lora
         else:
             if name == "norm_out.linear":  # diffusers (scale, shift) -> BFL (shift, scale)
                 half = w.up.shape[0] // 2
-                out["final_layer.adaLN_modulation.1"] = LoraWeight(w.down, torch.cat([w.up[half:], w.up[:half]]), w.scale)
+                out["final_layer.adaLN_modulation.1"] = LoraWeight(
+                    w.down, torch.cat([w.up[half:], w.up[:half]]), w.scale
+                )
 
     blocks = {int(m.group(1)) for k in lora if (m := re.match(r"(?:single_)?transformer_blocks\.(\d+)\.", k))}
     for i in sorted(blocks):
@@ -242,7 +244,7 @@ def _adaln_rows(n_chunks: int, dim: int) -> torch.Tensor:
 
 def _targets(info: dict, name: str, w: LoraWeight):
     """Yield (module path, down, up) for a BFL-named LoRA weight; up has strength-independent scale folded in."""
-    D, M1 = info["inner"], info["mlp_in_out"]
+    D = info["inner"]
     up = w.up * w.scale
     flux2 = info["kind"] == "flux2"
     if m := re.fullmatch(r"double_blocks\.(\d+)\.(img|txt)_(attn\.qkv|attn\.proj|mlp\.0|mlp\.2|mod\.lin)", name):

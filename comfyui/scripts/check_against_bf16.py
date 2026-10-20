@@ -43,7 +43,6 @@ import comfy.utils  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from huggingface_hub import snapshot_download  # noqa: E402
-
 from nunchaku_rocm.nodes import load_model  # noqa: E402
 
 PROMPT = "A cat holding a sign that says hello world, photo"
@@ -108,16 +107,24 @@ with torch.no_grad():
         out_ref = dm_ref(x, t, ctx_dm, y=pooled, **guid)
         out_q = dm_q(x, t, ctx_dm, y=pooled, **guid)
         c = captured
-        dkw = dict(hidden_states=c["img"], encoder_hidden_states=c["txt"], timestep=c["timesteps"],
-                   img_ids=c["img_ids"][0], txt_ids=c["txt_ids"][0], return_dict=False)
+        dkw = dict(
+            hidden_states=c["img"],
+            encoder_hidden_states=c["txt"],
+            timestep=c["timesteps"],
+            img_ids=c["img_ids"][0],
+            txt_ids=c["txt_ids"][0],
+            return_dict=False,
+        )
         if args.kind == "flux1":
             dkw["pooled_projections"] = c["y"]
             if diff.config.guidance_embeds:
                 dkw["guidance"] = c["guidance"]
         tok_d = diff(**dkw)[0]
         tok_ref, tok_q = dm_ref.process_img(out_ref)[0], dm_q.process_img(out_q)[0]
-        print(f"{sigma:>6} {rel(out_q, out_ref):>23.4f} {rel(tok_q, tok_d):>27.4f} {rel(tok_d, tok_ref):>24.4f}",
-              flush=True)
+        print(
+            f"{sigma:>6} {rel(out_q, out_ref):>23.4f} {rel(tok_q, tok_d):>27.4f} {rel(tok_d, tok_ref):>24.4f}",
+            flush=True,
+        )
 dm_q.forward_orig = orig_forward_orig
 del diff
 torch.cuda.empty_cache()
@@ -133,8 +140,9 @@ latent = torch.zeros(latent_shape)
 noise = comfy.sample.prepare_noise(latent, 0)
 images = {}
 for name, model in (("bf16", ref), ("nunchaku", ours)):
-    samples = comfy.sample.sample(model, noise, args.steps, 1.0, "euler", "simple", positive, negative, latent,
-                                  disable_pbar=True, seed=0)
+    samples = comfy.sample.sample(
+        model, noise, args.steps, 1.0, "euler", "simple", positive, negative, latent, disable_pbar=True, seed=0
+    )
     with torch.no_grad():
         decoded = vae.decode(samples)
     images[name] = (decoded[0].detach().float().clamp(0, 1).cpu().numpy() * 255).round()
@@ -143,6 +151,8 @@ for name, model in (("bf16", ref), ("nunchaku", ours)):
 
         Image.fromarray(images[name].astype(np.uint8)).save(os.path.join(args.out, f"comfy-{args.kind}-{name}.png"))
 a, b = images["nunchaku"], images["bf16"]
-print(f"end to end ({args.steps} steps): image PSNR nunchaku vs bf16 {10 * np.log10(255**2 / ((a - b) ** 2).mean()):.2f} dB",
-      flush=True)
+print(
+    f"end to end ({args.steps} steps): image PSNR nunchaku vs bf16 {10 * np.log10(255**2 / ((a - b) ** 2).mean()):.2f} dB",
+    flush=True,
+)
 os._exit(0)

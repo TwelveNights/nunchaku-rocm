@@ -22,9 +22,7 @@ _PKG = "_nunchaku_triton"
 def load_kernels(name: str):
     """Load ``nunchaku/ops/triton/<name>.py`` standalone, resolving its relative imports."""
     if _PKG not in sys.modules:
-        pkg = importlib.util.module_from_spec(
-            importlib.util.spec_from_loader(_PKG, loader=None, is_package=True)
-        )
+        pkg = importlib.util.module_from_spec(importlib.util.spec_from_loader(_PKG, loader=None, is_package=True))
         pkg.__path__ = [str(_TRITON_DIR)]
         sys.modules[_PKG] = pkg
 

@@ -38,14 +38,26 @@ url = f"http://127.0.0.1:{port}"
 
 
 def call(path, payload=None):
-    req = urllib.request.Request(url + path, data=None if payload is None else json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        url + path,
+        data=None if payload is None else json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read())
 
 
-cmd = [sys.executable, "-u", os.path.join(args.comfy, "main.py"), "--listen", "127.0.0.1", "--port", str(port),
-       "--disable-auto-launch", *args.comfy_arg]
+cmd = [
+    sys.executable,
+    "-u",
+    os.path.join(args.comfy, "main.py"),
+    "--listen",
+    "127.0.0.1",
+    "--port",
+    str(port),
+    "--disable-auto-launch",
+    *args.comfy_arg,
+]
 if args.extra_model_paths:
     cmd += ["--extra-model-paths-config", args.extra_model_paths]
 log = open(os.path.join(args.comfy, "run_workflows.log"), "w")

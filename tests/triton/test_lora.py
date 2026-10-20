@@ -44,7 +44,15 @@ def check(got, expected):
 
 def test_flux1_diffusers_format():
     q, k, v, add_q = lora(D, D), lora(D, D), lora(D, D), lora(D, D)
-    mod, sq, sk, sv, smlp, sout, snorm = lora(6 * D, D), lora(D, D), lora(D, D), lora(D, D), lora(H, D), lora(D, D + H), lora(3 * D, D)
+    mod, sq, sk, sv, smlp, sout, snorm = (
+        lora(6 * D, D),
+        lora(D, D),
+        lora(D, D),
+        lora(D, D),
+        lora(H, D),
+        lora(D, D + H),
+        lora(3 * D, D),
+    )
     norm_out, ff = lora(2 * D, D), lora(4 * D, D)
     sd = {}
     for name, (a, b) in {
@@ -81,7 +89,10 @@ def test_flux1_kohya_matches_bfl():
         "final_layer.adaLN_modulation.1": lora(2 * D, D), "img_in": lora(D, 16),
     }  # fmt: skip
     alpha, r = 2.0, 4
-    kohya, bfl = {"lora_te1_text_model_x.lora_down.weight": torch.zeros(1, 1), "lora_te1_text_model_x.lora_up.weight": torch.zeros(1, 1)}, {}
+    kohya, bfl = {
+        "lora_te1_text_model_x.lora_down.weight": torch.zeros(1, 1),
+        "lora_te1_text_model_x.lora_up.weight": torch.zeros(1, 1),
+    }, {}
     for name, (a, b) in weights.items():
         kname = "lora_unet_" + name.replace(".", "_")
         kohya[f"{kname}.lora_down.weight"], kohya[f"{kname}.lora_up.weight"] = a, b
@@ -123,8 +134,13 @@ def test_flux2_bfl_and_diffusers_agree():
 
 def test_unknown_module_rejected():
     with pytest.raises(ValueError):
-        deltas(FLUX2, {"diffusion_model.double_blocks.0.img_mod.lin.lora_A.weight": torch.zeros(4, D),
-                       "diffusion_model.double_blocks.0.img_mod.lin.lora_B.weight": torch.zeros(6 * D, 4)})
+        deltas(
+            FLUX2,
+            {
+                "diffusion_model.double_blocks.0.img_mod.lin.lora_A.weight": torch.zeros(4, D),
+                "diffusion_model.double_blocks.0.img_mod.lin.lora_B.weight": torch.zeros(6 * D, 4),
+            },
+        )
 
 
 def _svdq_linear(in_f, out_f, rank, device):

@@ -85,8 +85,10 @@ def comfy_unet_config(config: dict) -> tuple[dict, type]:
 def load_nunchaku_transformer(path: str, config: dict, dtype: torch.dtype):
     from nunchaku import NunchakuFlux2Transformer2DModel, NunchakuFluxTransformer2DModelV2
 
-    cls = NunchakuFlux2Transformer2DModel if config["_class_name"] == "Flux2Transformer2DModel" else (
-        NunchakuFluxTransformer2DModelV2
+    cls = (
+        NunchakuFlux2Transformer2DModel
+        if config["_class_name"] == "Flux2Transformer2DModel"
+        else (NunchakuFluxTransformer2DModelV2)
     )
     return cls.from_pretrained(path, torch_dtype=dtype)
 
@@ -160,9 +162,7 @@ class NunchakuLoraLoader:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load"
     CATEGORY = "Nunchaku (ROCm)"
-    DESCRIPTION = (
-        "Applies a FLUX.1 / FLUX.2 [klein] LoRA (ComfyUI/BFL, kohya or diffusers format) to a Nunchaku model."
-    )
+    DESCRIPTION = "Applies a FLUX.1 / FLUX.2 [klein] LoRA (ComfyUI/BFL, kohya or diffusers format) to a Nunchaku model."
 
     def load(self, model: comfy.model_patcher.ModelPatcher, lora_name: str, strength: float):
         if not isinstance(model.model.diffusion_model, NunchakuFluxAdapter):
