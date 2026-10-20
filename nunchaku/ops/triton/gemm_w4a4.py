@@ -847,6 +847,33 @@ def _launch_gemm_int4_gelu_quant(
         torch.sum(lora_part, dim=0, out=lora_act_out[:M])
 
 
+def _gemm_w4a4_swiglu_quant(
+    act, wgt, ascales, wscales, bias, lora_act_in, lora_up, qout, oscales, smooth, lora_down, lora_act_out,
+    act_unsigned, out, wcscales, norm_q, rotary_emb, fuse_silu, fp4, alpha, out_dtype,
+) -> None:
+    """``gemm_w4a4(..., fuse_swiglu=True)``: the native fused kernel on gfx11, else the unfused equivalent."""
+    assert out is None and qout is not None and oscales is not None, "fuse_swiglu writes qout/oscales, not out"
+    assert not (fp4 or fuse_silu or wcscales is not None or norm_q is not None or rotary_emb is not None), (
+        "fuse_swiglu is int4-only and excludes the other epilogues"
+    )
+    assert alpha is None or alpha == 1.0
+    assert (lora_down is None) == (lora_act_out is None), "lora_down and lora_act_out must be given together"
+    M, N = act.shape[0], wgt.shape[0]
+    has_lora = lora_act_in is not None and lora_up is not None
+    la, lu = (lora_act_in, lora_up) if has_lora else (None, None)
+    qout2d = qout.reshape(-1, qout.shape[-1])
+    if _native_w4a4.try_gemm_swiglu_quant(
+        act, wgt, ascales, wscales, bias, la, lu, qout2d, oscales, smooth, lora_down, lora_act_out, act_unsigned
+    ):
+        return
+    # unfused: the GEMM (interleaved columns), Flux2SwiGLU on the 16-bit output, the activation quantizer
+    x = gemm_w4a4(act, wgt, ascales=ascales, wscales=wscales, bias=bias, lora_act_in=la, lora_up=lu,
+                  act_unsigned=act_unsigned, out_dtype=out_dtype)
+    x = x.view(M, N // 32, 2, 16)
+    y = (torch.nn.functional.silu(x[:, :, 0]) * x[:, :, 1]).reshape(M, N // 2)
+    _launch_quantize(y, qout2d, oscales, lora_down, lora_act_out, smooth, fuse_glu=False, fp4=False)
+
+
 def gemm_w4a4(
     act: torch.Tensor,
     wgt: torch.Tensor,
@@ -870,6 +897,7 @@ def gemm_w4a4(
     fp4: bool = False,
     alpha: float = 1.0,
     out_dtype: torch.dtype = torch.bfloat16,
+    fuse_swiglu: bool = False,
 ) -> torch.Tensor:
     """
     W4A4 GEMM with per-group dequantization and a fused low-rank correction.
@@ -904,10 +932,26 @@ def gemm_w4a4(
     smooth_factor : (N,), next layer's smoothing factor
     lora_down : (N, R'), next layer's LoRA down-projection weight
     lora_act_out : (M, R'), next layer's LoRA hidden state, written in place
+    fuse_swiglu : SwiGLU MLP input projection (FLUX.2): ``wgt`` is the (2H, K/2)
+        ``[gate | up]`` weight with rows interleaved by
+        :func:`.native.w4a4.interleave_swiglu` (as are ``wscales``' columns,
+        ``bias`` and ``lora_up``); instead of the GEMM output, ``silu(gate) * up``
+        is quantized (signed int4, ``smooth_factor`` (H,)) into ``qout`` (M, H/2) /
+        ``oscales`` (H/64, M), with the next layer's LoRA-down (``lora_down`` (H, R'))
+        into ``lora_act_out`` -- what diffusers' ``Flux2SwiGLU`` followed by the next
+        layer's ``quantize`` computes. ``out`` must be ``None``; returns ``None``.
     fp4 : decode nibbles as ``e2m1`` instead of int4
     alpha : global output scale (NVFP4 weight tensor scale)
     """
     assert ascales is not None and wscales is not None, "W4A4 GEMM requires both scale tensors"
+
+    if fuse_swiglu:
+        _gemm_w4a4_swiglu_quant(
+            act.reshape(-1, act.shape[-1]), wgt, ascales, wscales, bias, lora_act_in, lora_up, qout, oscales,
+            smooth_factor, lora_down, lora_act_out, act_unsigned, out, wcscales, norm_q, rotary_emb, fuse_silu, fp4,
+            alpha, out_dtype,
+        )
+        return None
 
     act = act.reshape(-1, act.shape[-1])
     M = act.shape[0]

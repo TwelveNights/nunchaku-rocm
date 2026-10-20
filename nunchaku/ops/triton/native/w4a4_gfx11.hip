@@ -514,54 +514,135 @@ static __device__ __forceinline__ float gelu_tanh(float x) {
   return (x * 0.5f) * (t + 1.0f);
 }
 
+// The next layer's LoRA-down of a quantizing epilogue, on the 16-bit WMMA: for the NO output columns of this
+// workgroup (activation tile xs, T, staged in LDS by the caller), lora_part[pid, m, :] = xs[m, :] @ lora_down[n_base +
+// 0 : NO, :] -- one fp32 partial per workgroup column, which the host sums over pid in a fixed order (deterministic;
+// fp32 atomics made same-seed images differ). lora_down goes through LDS transposed, 32 ranks per slab; load(0) is
+// meant to be issued early so its latency hides behind the activation / quantization work.
+template <class T, int BM, int NO, int NT>
+struct LoraDownStage {
+  static constexpr int XP = NO + 8;  // LDS row pitch (16-bit elements): keeps 16-byte rows, spreads banks
+  static constexpr int LDS = (BM + 32) * XP * 2;  // xs [BM][XP] + ldT [32][XP]
+  static constexpr int CH = NO * 4, PER = (CH + NT - 1) / NT;  // 16-byte (8-rank) chunks per 32-rank slab
+  v4i ldv[PER];
+
+  __device__ __forceinline__ void load(const u16* lora_down, int stride_ld, int n_base, int R2, int rc, int tid) {
+    const int rw = R2 - rc < 32 ? R2 - rc : 32;
+#pragma unroll
+    for (int q = 0; q < PER; q++) {
+      const int ch = tid + q * NT, n = ch >> 2, h = ch & 3;
+      if (ch < CH && h * 8 < rw) ldv[q] = *(const v4i*)(lora_down + (long)(n_base + n) * stride_ld + rc + h * 8);
+    }
+  }
+
+  // all threads; xs must be complete in LDS (the first barrier below publishes it)
+  __device__ __forceinline__ void run(unsigned char* smem, const u16* lora_down, int stride_ld, int n_base, int R2,
+                                      float* part, int stride_lom, int bm0, int M, int tid, int wave, int r16, int hl) {
+    const u16* xs = (const u16*)smem;
+    u16* ldT = (u16*)smem + BM * XP;
+    for (int rc = 0; rc < R2; rc += 32) {
+      const int rw = R2 - rc < 32 ? R2 - rc : 32;  // 16 or 32 (R2 % 16 == 0)
+      if (rc > 0) {
+        syncthreads();  // the previous slab's ldT reads are done
+        load(lora_down, stride_ld, n_base, R2, rc, tid);
+      }
+#pragma unroll
+      for (int q = 0; q < PER; q++) {  // write the slab transposed
+        const int ch = tid + q * NT, n = ch >> 2, h = ch & 3;
+        if (ch < CH && h * 8 < rw) {
+          const int vv[4] = {ldv[q].x, ldv[q].y, ldv[q].z, ldv[q].w};
+#pragma unroll
+          for (int k = 0; k < 4; k++) {
+            ldT[(h * 8 + 2 * k) * XP + n] = (u16)(vv[k] & 0xffff);
+            ldT[(h * 8 + 2 * k + 1) * XP + n] = (u16)((unsigned)vv[k] >> 16);
+          }
+        }
+      }
+      syncthreads();  // xs and ldT visible
+      for (int f = wave; f < (BM / 16) * (rw / 16); f += NT / 32) {  // wave-uniform: (16-row slice, 16-rank block)
+        const int mt = f % (BM / 16), rs = f / (BM / 16);
+        v8f d = {};
+        __asm__ volatile("" : "+v"(d));  // see the constant-C WMMA miscompile note in the main loop
+#pragma unroll
+        for (int nc = 0; nc < NO / 16; nc++) {
+          const v4i* pa = (const v4i*)(xs + (mt * 16 + r16) * XP + nc * 16);
+          const v4i* pb = (const v4i*)(ldT + (rs * 16 + r16) * XP + nc * 16);
+          const v4i a0 = pa[0], a1 = pa[1], b0 = pb[0], b1 = pb[1];
+          d = T::wmma(__builtin_bit_cast(typename T::frag, (v8i){a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w}),
+                      __builtin_bit_cast(typename T::frag, (v8i){b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w}), d);
+        }
+        if (bm0 + mt * 16 < M) {  // M % 16 == 0: 16-row slices are all in range or all padding
+          float* pp = part + (long)(bm0 + mt * 16 + hl) * stride_lom + rc + rs * 16 + r16;
+#pragma unroll
+          for (int i = 0; i < 8; i++) pp[(long)(2 * i) * stride_lom] = d[i];
+        }
+      }
+    }
+  }
+};
+
+// Arguments of the quantizing epilogues (GeluQuantEpilogue, SwigluQuantEpilogue); "N" is the quantized width.
+struct QuantArgs {
+  unsigned char* qout;  // (>= M, N/2) packed codes
+  u16* oscales;         // (N/64, stride_osg), T
+  const u16* smooth;    // (N,), T; null: none
+  const u16* lora_down; // (N, R2), T; null: no LoRA-down
+  float* lora_part;     // (N / workgroup width, M, R2) fp32
+  long long stride_lop; // lora_part stride of dim 0, in floats
+  int R2, stride_qm, stride_osg, stride_ld, stride_lom;
+  float shift;          // GELU only
+};
+
+// Store the quantized codes / scales of 16-row slices: per row i of a slice, a 16-lane group holds codes (0..15, as
+// nibbles) of 16 consecutive columns; 8 lanes OR their nibbles into one 32-bit word, which every lane of the 8 then
+// holds for all 8 rows i; lane (r16 & 7) == i stores row i's (one store per lane, no masking).
+static __device__ __forceinline__ int pack8(int code, int r16) {
+  int w = code << (4 * (r16 & 7));
+  w |= dpp_i32<0x161>(w);
+  w |= dpp_i32<0x162>(w);
+  w |= dpp_i32<0x164>(w);
+  return w;
+}
+static __device__ __forceinline__ int select8(const int (&v)[8], int sel) {
+  int w = v[0];
+#pragma unroll
+  for (int i = 1; i < 8; i++) w = sel == i ? v[i] : w;
+  return w;
+}
+static __device__ __forceinline__ float select8f(const float (&v)[8], int sel) {
+  float w = v[0];
+#pragma unroll
+  for (int i = 1; i < 8; i++) w = sel == i ? v[i] : w;
+  return w;
+}
+
 // The fc1 epilogue of a GELU MLP (EpilogueGelu + EpilogueLoraDown + EpilogueQuantize of the CUDA kernel; same
 // maths as _gemm_w4a4_int4_gelu_quant_kernel in gemm_w4a4.py), on the fp32 tile:
 //   [out = acc]  x = gelu(acc)
-//   lora_part[pid_n, m, :] = T(x)[m, tile] @ lora_down[tile, :]      per-N-tile partial of the next layer's LoRA-down;
-//                                                                    the host sums the partials in a fixed order
+//   lora_part[pid_n, m, :] = T(x)[m, tile] @ lora_down[tile, :]      (LoraDownStage)
 //   v = (x + shift) / smooth;  scale = max(max_64(v), 0) / 15;  code = clamp(rint(v / scale), 0, 15)  (unsigned int4)
 // Needs WN % 64 == 0 (a 64-wide quantization group lives in one wave) and M % 16 == 0, N % BN == 0 (host-checked).
 struct GeluQuantEpilogue {
-  struct Args {
-    unsigned char* qout;  // (>= M, N/2) packed codes
-    u16* oscales;         // (N/64, stride_osg), T
-    const u16* smooth;    // (N,), T; null: none
-    const u16* lora_down; // (N, R2), T; null: no LoRA-down
-    float* lora_part;     // (N/BN, M, R2) fp32
-    long long stride_lop; // lora_part stride of dim 0, in floats
-    int R2, stride_qm, stride_osg, stride_ld, stride_lom;
-    float shift;
-  };
-  static constexpr int XP_PAD = 8;  // LDS row pad (16-bit elements): keeps 16-byte rows, spreads banks
+  typedef QuantArgs Args;
   template <class Tl>
-  static constexpr int lds_bytes() { return (Tl::BM + 32) * (Tl::BN + XP_PAD) * 2; }
+  static constexpr int lds_bytes() { return LoraDownStage<BF16, Tl::BM, Tl::BN, Tl::THREADS>::LDS; }
 
   template <class T, class Tl>
   static __device__ __forceinline__ void apply(const GemmArgs& g, const Args& e, v8f (&acc)[Tl::TM][Tl::TN],
                                                const TileCtx<Tl::TM, Tl::TN>& c) {
     constexpr int TM = Tl::TM, TN = Tl::TN, BM = Tl::BM, BN = Tl::BN, WN = Tl::WN, NT = Tl::THREADS;
-    constexpr int NW = NT / 32, XP = BN + XP_PAD;
+    typedef LoraDownStage<T, BM, BN, NT> LD;
+    constexpr int XP = LD::XP;
     static_assert(WN % 64 == 0, "quantization groups must not straddle waves");
     const int M = g.M, r16 = c.r16, hl = c.hl, m0 = c.m0, n0 = c.n0;
     const int wm0 = m0 - c.bm0, wn0 = n0 - c.bn0;
 
-    // issue the loads of the first 32-rank slab of lora_down[bn0 : bn0 + BN] now; they land during the GELU work
-    constexpr int LD_CH = BN * 4, LD_PER = (LD_CH + NT - 1) / NT;  // 16-byte (8-rank) chunks
-    v4i ldv[LD_PER];
-    auto load_ld = [&](int rc) {
-      const int rw = e.R2 - rc < 32 ? e.R2 - rc : 32;
-#pragma unroll
-      for (int q = 0; q < LD_PER; q++) {
-        const int ch = c.tid + q * NT, n = ch >> 2, h = ch & 3;
-        if (ch < LD_CH && h * 8 < rw) ldv[q] = *(const v4i*)(e.lora_down + (long)(c.bn0 + n) * e.stride_ld + rc + h * 8);
-      }
-    };
-    if (e.lora_down) load_ld(0);
+    LD ld;  // the first lora_down slab's loads go out now and land during the GELU work
+    if (e.lora_down) ld.load(e.lora_down, e.stride_ld, c.bn0, e.R2, 0, c.tid);
 
     if (g.out) StoreEpilogue::store<T>(g, acc, c);  // optional pre-GELU output
 
     u16* xs = (u16*)c.smem;  // [BM][XP]  T(gelu(x)), the LoRA-down WMMA's A operand
-    u16* ldT = xs + BM * XP; // [32][XP]  lora_down[bn0 : bn0 + BN, rc : rc + 32]^T, its B operand
 #pragma unroll
     for (int t = 0; t < TM; t++)
 #pragma unroll
@@ -574,13 +655,11 @@ struct GeluQuantEpilogue {
         }
 
     // ---- quantize. Per row and 64-group: the group max is a lane-local max over 4 sub-tiles plus a 16-lane
-    // butterfly. 8 lanes (8 consecutive columns) OR their nibbles into one 32-bit word, which every lane of the
-    // group then holds for all 8 rows i; lane (r16 & 7) == i stores row i's (one store per lane, no masking).
-    // Likewise lanes r16 < 8 store the scale of row r16. M % 16 == 0: a 16-row slice is all in range or all padding.
+    // butterfly; lanes r16 < 8 store the scale of row r16. M % 16 == 0: a 16-row slice is all in range or padding.
     float ism[TN];
 #pragma unroll
     for (int j = 0; j < TN; j++) ism[j] = e.smooth ? 1.0f / T::to_f32(e.smooth[n0 + j * 16 + r16]) : 1.0f;
-    const int sh = 4 * (r16 & 7), sel = r16 & 7;
+    const int sel = r16 & 7;
     const unsigned q_lane = (unsigned)((2 * sel + hl) * e.stride_qm + ((n0 + (r16 & 8)) >> 1));
 #pragma unroll
     for (int t = 0; t < TM; t++) {
@@ -605,79 +684,120 @@ struct GeluQuantEpilogue {
           scl[i] = scale;
 #pragma unroll
           for (int jj = 0; jj < 4; jj++) {
-            float q = __builtin_rintf(v[jj] * inv);
-            q = __builtin_fminf(__builtin_fmaxf(q, 0.0f), 15.0f);
-            int w = ((int)q) << sh;
-            w |= dpp_i32<0x161>(w);
-            w |= dpp_i32<0x162>(w);
-            w |= dpp_i32<0x164>(w);
-            wd[jj][i] = w;
+            const float q = __builtin_fminf(__builtin_fmaxf(__builtin_rintf(v[jj] * inv), 0.0f), 15.0f);
+            wd[jj][i] = pack8((int)q, r16);
           }
         }
-        float s = scl[0];
+        if (r16 < 8) e.oscales[(long)((n0 >> 6) + gg) * e.stride_osg + m0 + t * 16 + 2 * sel + hl] = T::from_f32(select8f(scl, sel));
 #pragma unroll
-        for (int i = 1; i < 8; i++) s = sel == i ? scl[i] : s;
-        if (r16 < 8) e.oscales[(long)((n0 >> 6) + gg) * e.stride_osg + m0 + t * 16 + 2 * sel + hl] = T::from_f32(s);
-#pragma unroll
-        for (int jj = 0; jj < 4; jj++) {
-          int w = wd[jj][0];
-#pragma unroll
-          for (int i = 1; i < 8; i++) w = sel == i ? wd[jj][i] : w;
-          *(int*)(qrow + q_lane + (gg * 4 + jj) * 8) = w;
-        }
+        for (int jj = 0; jj < 4; jj++) *(int*)(qrow + q_lane + (gg * 4 + jj) * 8) = select8(wd[jj], sel);
       }
     }
 
-    // ---- next layer's LoRA-down on the 16-bit WMMA, 32 ranks per slab: lora_part[pid_n] = xs @ lora_down[tile]
-    if (e.lora_down) {
-      const int pid_n = c.bn0 / BN;
-      for (int rc = 0; rc < e.R2; rc += 32) {
-        const int rw = e.R2 - rc < 32 ? e.R2 - rc : 32;  // 16 or 32 (R2 % 16 == 0)
-        if (rc > 0) {
-          syncthreads();  // the previous slab's ldT reads are done
-          load_ld(rc);
+    if (e.lora_down)
+      ld.run(c.smem, e.lora_down, e.stride_ld, c.bn0, e.R2, e.lora_part + (long)(c.bn0 / BN) * e.stride_lop,
+             e.stride_lom, c.bm0, M, c.tid, c.wave, r16, hl);
+  }
+};
+
+// silu(g) = g / (1 + exp(-g)); the division as in gelu_tanh (d clamped: g << 0 gives -0, not NaN)
+static __device__ __forceinline__ float silu(float x) {
+  const float d = __builtin_fminf(__builtin_exp2f(x * -1.44269504088896341f) + 1.0f, 8.5070592e37f);
+  const float r = __builtin_amdgcn_rcpf(d);
+  const float q0 = x * r;
+  return __builtin_fmaf(__builtin_fmaf(-d, q0, x), r, q0);
+}
+
+// The linear_in epilogue of a SwiGLU MLP (FLUX.2 [klein]): y = silu(gate) * up, then the next layer's LoRA-down and
+// signed int4 quantization of y -- the work of diffusers' Flux2SwiGLU plus linear_out's activation quantizer
+// (quantize_w4a4_act_fuse_lora), without materializing the (M, 2H) GEMM output or the (M, H) activation.
+//
+// linear_in's output rows are interleaved in blocks of 16 at load time (nunchaku.ops.fused.interleave_swiglu): row
+// 32b + w is gate row 16b + w for w < 16, else up row 16b + w - 16. A wave's sub-tiles j = 2jj, 2jj + 1 are then
+// the gate and up halves of the same 16 output columns, in the same lanes. Output column of (jj, lane):
+//   bn0 / 2 + (wave's 64-column half) * 32 + 16 jj + r16.
+// A workgroup (BN = 128, 2 x WN = 64) produces 64 output columns: one quantization group per row, whose max over
+// both waves goes through LDS. Signed int4 as the activation quantizer: scale = max|v| / 7, code = clamp(rint(v /
+// scale), -8, 7), v = y / smooth. M % 16 == 0 and N % 128 == 0 (host-checked).
+struct SwigluQuantEpilogue {
+  typedef QuantArgs Args;
+  template <class Tl>
+  static constexpr int lds_bytes() { return LoraDownStage<BF16, Tl::BM, Tl::BN / 2, Tl::THREADS>::LDS + 2 * Tl::BM * 4; }
+
+  template <class T, class Tl>
+  static __device__ __forceinline__ void apply(const GemmArgs& g, const Args& e, v8f (&acc)[Tl::TM][Tl::TN],
+                                               const TileCtx<Tl::TM, Tl::TN>& c) {
+    constexpr int TM = Tl::TM, BM = Tl::BM, BN = Tl::BN, NT = Tl::THREADS, NO = BN / 2;
+    static_assert(BN == 128 && Tl::WN == 64, "one quantization group (64 outputs) per workgroup, 2 waves wide");
+    typedef LoraDownStage<T, BM, NO, NT> LD;
+    constexpr int XP = LD::XP;
+    const int M = g.M, r16 = c.r16, hl = c.hl, m0 = c.m0;
+    const int wm0 = m0 - c.bm0, wn = (c.n0 - c.bn0) / 64;
+    const int o_base = c.bn0 / 2;                   // the workgroup's first output column
+    const int o_wave = wn * 32;                     // this wave's first column within the 64
+    float* red = (float*)(c.smem + LD::LDS);        // [2][BM] per-wave row max |v|
+
+    LD ld;
+    if (e.lora_down) ld.load(e.lora_down, e.stride_ld, o_base, e.R2, 0, c.tid);
+
+    u16* xs = (u16*)c.smem;  // [BM][XP]  T(y)
+    float y[TM][2][8];
+    float ism[2];
+#pragma unroll
+    for (int jj = 0; jj < 2; jj++) ism[jj] = e.smooth ? 1.0f / T::to_f32(e.smooth[o_base + o_wave + jj * 16 + r16]) : 1.0f;
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        float mx = 0.0f;
+#pragma unroll
+        for (int jj = 0; jj < 2; jj++) {
+          const float v = silu(acc[t][2 * jj][i]) * acc[t][2 * jj + 1][i];
+          xs[(wm0 + t * 16 + 2 * i + hl) * XP + o_wave + jj * 16 + r16] = T::from_f32(v);
+          y[t][jj][i] = v * ism[jj];
+          mx = __builtin_fmaxf(mx, __builtin_fabsf(y[t][jj][i]));
         }
+        mx = max16(mx);
+        if (r16 == 0) red[wn * BM + wm0 + t * 16 + 2 * i + hl] = mx;
+      }
+    syncthreads();  // the other wave's row maxima
+
+    const int sel = r16 & 7;
+    const unsigned q_lane = (unsigned)((2 * sel + hl) * e.stride_qm + ((o_base + o_wave + (r16 & 8)) >> 1));
 #pragma unroll
-        for (int q = 0; q < LD_PER; q++) {  // write the slab transposed
-          const int ch = c.tid + q * NT, n = ch >> 2, h = ch & 3;
-          if (ch < LD_CH && h * 8 < rw) {
-            const int vv[4] = {ldv[q].x, ldv[q].y, ldv[q].z, ldv[q].w};
+    for (int t = 0; t < TM; t++) {
+      if (m0 + t * 16 >= M) continue;  // wave-uniform
+      unsigned char* qrow = e.qout + (long)(m0 + t * 16) * e.stride_qm;
+      float scl[8];
+      int wd[2][8];
 #pragma unroll
-            for (int k = 0; k < 4; k++) {
-              ldT[(h * 8 + 2 * k) * XP + n] = (u16)(vv[k] & 0xffff);
-              ldT[(h * 8 + 2 * k + 1) * XP + n] = (u16)((unsigned)vv[k] >> 16);
-            }
-          }
-        }
-        syncthreads();  // xs and ldT visible
-        for (int f = c.wave; f < (BM / 16) * (rw / 16); f += NW) {  // wave-uniform: (16-row slice, 16-rank block)
-          const int mt = f % (BM / 16), rs = f / (BM / 16);
-          v8f d = {};
-          __asm__ volatile("" : "+v"(d));  // see the constant-C WMMA miscompile note in the main loop
+      for (int i = 0; i < 8; i++) {
+        const int ml = wm0 + t * 16 + 2 * i + hl;
+        const float scale = __builtin_fmaxf(red[ml], red[BM + ml]) / 7.0f;
+        const float inv = 1.0f / (scale == 0.0f ? 1.0f : scale);
+        scl[i] = scale;
 #pragma unroll
-          for (int nc = 0; nc < BN / 16; nc++) {
-            const v4i* pa = (const v4i*)(xs + (mt * 16 + r16) * XP + nc * 16);
-            const v4i* pb = (const v4i*)(ldT + (rs * 16 + r16) * XP + nc * 16);
-            const v4i a0 = pa[0], a1 = pa[1], b0 = pb[0], b1 = pb[1];
-            d = T::wmma(__builtin_bit_cast(typename T::frag, (v8i){a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w}),
-                        __builtin_bit_cast(typename T::frag, (v8i){b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w}), d);
-          }
-          if (c.bm0 + mt * 16 < M) {
-            float* pp = e.lora_part + (long)pid_n * e.stride_lop + (long)(c.bm0 + mt * 16 + hl) * e.stride_lom + rc +
-                        rs * 16 + r16;
-#pragma unroll
-            for (int i = 0; i < 8; i++) pp[(long)(2 * i) * e.stride_lom] = d[i];
-          }
+        for (int jj = 0; jj < 2; jj++) {
+          const float q = __builtin_fminf(__builtin_fmaxf(__builtin_rintf(y[t][jj][i] * inv), -8.0f), 7.0f);
+          wd[jj][i] = pack8((int)q & 0xF, r16);
         }
       }
+      if (wn == 0 && r16 < 8)
+        e.oscales[(long)(o_base >> 6) * e.stride_osg + m0 + t * 16 + 2 * sel + hl] = T::from_f32(select8f(scl, sel));
+#pragma unroll
+      for (int jj = 0; jj < 2; jj++) *(int*)(qrow + q_lane + jj * 8) = select8(wd[jj], sel);
     }
+
+    if (e.lora_down)
+      ld.run(c.smem, e.lora_down, e.stride_ld, o_base, e.R2, e.lora_part + (long)(c.bn0 / BN) * e.stride_lop,
+             e.stride_lom, c.bm0, M, c.tid, c.wave, r16, hl);
   }
 };
 
 // ---------------------------------------------------------------------------------------------------------------
 // Instantiations: <name>_<bf16|fp16>_<s|u>_<BM>x<BN>_<WM>x<WN> (s/u = signed/unsigned activations), name = w4a4
-// (plain), w4a4qk (QKNormRopeEpilogue), w4a4gq (GeluQuantEpilogue). The host-side tile tables (w4a4.py: TILES,
-// QK_TILES, GQ_TILES) must list the same tiles.
+// (plain), w4a4qk (QKNormRopeEpilogue), w4a4gq (GeluQuantEpilogue), w4a4sq (SwigluQuantEpilogue). The host-side
+// tile tables (w4a4.py: TILES, QK_TILES, GQ_TILES, SQ_TILES) must list the same tiles.
 
 // (the plain kernel takes no epilogue argument: an empty struct would still occupy a kernel argument slot)
 #define W4A4_KERNEL(NAME, EPI, DT, T, SU, SIGNED, BM, BN, WM, WN)                                                \
@@ -689,8 +809,10 @@ struct GeluQuantEpilogue {
 #define W4A4_EPI_ARG_StoreEpilogue StoreEpilogue::Args{}
 #define W4A4_EPI_PARAM_QKNormRopeEpilogue , QKNormRopeEpilogue::Args e
 #define W4A4_EPI_ARG_QKNormRopeEpilogue e
-#define W4A4_EPI_PARAM_GeluQuantEpilogue , GeluQuantEpilogue::Args e
+#define W4A4_EPI_PARAM_GeluQuantEpilogue , QuantArgs e
 #define W4A4_EPI_ARG_GeluQuantEpilogue e
+#define W4A4_EPI_PARAM_SwigluQuantEpilogue , QuantArgs e
+#define W4A4_EPI_ARG_SwigluQuantEpilogue e
 #define W4A4_VARIANTS(NAME, EPI, BM, BN, WM, WN)                  \
   W4A4_KERNEL(NAME, EPI, bf16, BF16, s, true, BM, BN, WM, WN)     \
   W4A4_KERNEL(NAME, EPI, bf16, BF16, u, false, BM, BN, WM, WN)    \
@@ -705,3 +827,4 @@ W4A4_VARIANTS(w4a4, StoreEpilogue, 128, 128, 32, 64)
 // FLUX shapes, M = 512 included), and is the GELU epilogue's only fast tile with WN % 64 == 0 that fits in LDS.
 W4A4_VARIANTS(w4a4qk, QKNormRopeEpilogue, 128, 128, 32, 64)
 W4A4_VARIANTS(w4a4gq, GeluQuantEpilogue, 128, 128, 32, 64)
+W4A4_VARIANTS(w4a4sq, SwigluQuantEpilogue, 128, 128, 32, 64)

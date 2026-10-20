@@ -19,6 +19,7 @@ from diffusers.models.transformers.transformer_flux2 import (
     Flux2FeedForward,
     Flux2ParallelSelfAttention,
     Flux2SingleTransformerBlock,
+    Flux2SwiGLU,
     Flux2Transformer2DModel,
     Flux2TransformerBlock,
 )
@@ -26,7 +27,7 @@ from huggingface_hub import utils
 
 from ...ops.backend import get_backend
 from ...ops.dispatch import scaled_dot_product_attention
-from ...ops.fused import fused_qkv_norm_rottary
+from ...ops.fused import fused_qkv_norm_rottary, fused_swiglu_mlp, interleave_swiglu_linear_
 from ...utils import get_precision_from_quantization_config, pad_tensor
 from ..embeddings import pack_rotemb
 from ..linear import SVDQW4A4Linear
@@ -170,6 +171,13 @@ class NunchakuFlux2FeedForward(Flux2FeedForward):
         # SwiGLU outputs are signed, and FLUX.2 checkpoints are calibrated without the
         # unsigned-activation shift FLUX.1 uses after GELU, so linear_out keeps the signed path.
         self.linear_out = SVDQW4A4Linear.from_linear(other.linear_out, **kwargs)
+        # set by NunchakuFlux2Transformer2DModel.from_pretrained once linear_in's rows are interleaved
+        self.swiglu_fused = False
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.swiglu_fused:
+            return fused_swiglu_mlp(hidden_states, self.linear_in, self.linear_out)
+        return self.linear_out(self.act_fn(self.linear_in(hidden_states)))
 
 
 class NunchakuFlux2ParallelSelfAttention(Flux2ParallelSelfAttention):
@@ -210,6 +218,7 @@ class NunchakuFlux2ParallelSelfAttention(Flux2ParallelSelfAttention):
         self.out_proj = SVDQW4A4Linear.from_linear(out_proj, **kwargs)
         # signed activations, as in NunchakuFlux2FeedForward
         self.mlp_fc2 = SVDQW4A4Linear.from_linear(mlp_fc2, **kwargs)
+        self.swiglu_fused = False  # as in NunchakuFlux2FeedForward
 
     def forward(
         self,
@@ -240,8 +249,11 @@ class NunchakuFlux2ParallelSelfAttention(Flux2ParallelSelfAttention):
             raise NotImplementedError("attention_mask is not supported")
         qkv = fused_qkv_norm_rottary(hidden_states, self.qkv_proj, self.norm_q, self.norm_k, image_rotary_emb)
         attn_output = _attention(*qkv.chunk(3, dim=-1), self.heads, self.head_dim)
-        mlp_hidden_states = self.mlp_act_fn(self.mlp_fc1(hidden_states))
-        return self.out_proj(attn_output) + self.mlp_fc2(mlp_hidden_states)
+        if self.swiglu_fused:
+            mlp_out = fused_swiglu_mlp(hidden_states, self.mlp_fc1, self.mlp_fc2)
+        else:
+            mlp_out = self.mlp_fc2(self.mlp_act_fn(self.mlp_fc1(hidden_states)))
+        return self.out_proj(attn_output) + mlp_out
 
 
 class NunchakuFlux2TransformerBlock(Flux2TransformerBlock):
@@ -369,6 +381,19 @@ class NunchakuFlux2Transformer2DModel(Flux2Transformer2DModel, NunchakuModelLoad
             for module in transformer.modules():
                 if isinstance(module, SVDQW4A4Linear):
                     convert_svdq_linear_to_natural_layout(module)
+            # SwiGLU MLPs: interleave the input projection's gate/up rows so the GEMM can fuse the SwiGLU and the
+            # output projection's activation quantization (fused_swiglu_mlp; native on gfx11, unfused on Triton
+            # otherwise -- same results either way)
+            if precision == "int4":
+                for module in transformer.modules():
+                    if isinstance(module, NunchakuFlux2FeedForward) and isinstance(module.act_fn, Flux2SwiGLU):
+                        interleave_swiglu_linear_(module.linear_in)
+                        module.swiglu_fused = True
+                    elif isinstance(module, NunchakuFlux2ParallelSelfAttention) and isinstance(
+                        module.mlp_act_fn, Flux2SwiGLU
+                    ):
+                        interleave_swiglu_linear_(module.mlp_fc1)
+                        module.swiglu_fused = True
 
         return transformer
 

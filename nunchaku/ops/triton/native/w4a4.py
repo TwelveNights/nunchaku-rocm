@@ -39,15 +39,19 @@ __all__ = [
     "gemm",
     "gemm_gelu_quant",
     "gemm_qk",
+    "gemm_swiglu_quant",
+    "interleave_swiglu",
     "mode",
     "pick_tile",
     "status",
     "try_gemm",
     "try_gemm_gelu_quant",
     "try_gemm_qk",
+    "try_gemm_swiglu_quant",
     "unsupported_reason",
     "unsupported_reason_gelu_quant",
     "unsupported_reason_qk",
+    "unsupported_reason_swiglu_quant",
 ]
 
 _SOURCE = "w4a4_gfx11.hip"
@@ -64,6 +68,9 @@ TILES = [
 # epilogue needs WN % 64 == 0. Must match the W4A4_VARIANTS lists in w4a4_gfx11.hip.
 QK_TILES = [(128, 128, 32, 64)]
 GQ_TILES = [(128, 128, 32, 64)]
+# SwiGLU-quant (w4a4sq_*): BN = 128 = 2 waves of WN = 64 -> 64 output columns, one quantization group per row
+SQ_TILES = [(128, 128, 32, 64)]
+SWIGLU_BLOCK = 16  # linear_in rows interleaved in blocks of 16 (gate, up), see interleave_swiglu
 HEAD_DIM = 128
 GELU_SHIFT = 0.171875  # FLUX's unsigned-activation shift after GELU (as the Triton / CUDA kernels)
 
@@ -107,7 +114,7 @@ class _QKArgs(ctypes.Structure):
 
 
 class _GQArgs(ctypes.Structure):
-    """Mirror of ``GeluQuantEpilogue::Args``."""
+    """Mirror of ``QuantArgs`` (GeluQuantEpilogue / SwigluQuantEpilogue)."""
 
     _fields_ = [
         (name, ctypes.c_void_p) for name in ("qout", "oscales", "smooth", "lora_down", "lora_part")
@@ -292,6 +299,62 @@ def unsupported_reason_gelu_quant(
     return None
 
 
+def unsupported_reason_swiglu_quant(
+    act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down, lora_act_out
+) -> str | None:
+    """
+    As :func:`unsupported_reason_gelu_quant`, for the fused SwiGLU + signed int4
+    quantization epilogue: ``wgt`` (2H, K/2) with interleaved gate/up rows
+    (:func:`interleave_swiglu`); ``qout`` (>= M, H/2), ``oscales`` (H/64, >= M),
+    ``smooth`` (H,), ``lora_down`` (H, R2) describe the quantized (M, H) output.
+    """
+    T = oscales.dtype
+    reason = unsupported_reason(act, wgt, None, ascales, wscales, bias, lora_act, lora_up, dtype=T)
+    if reason is not None:
+        return reason
+    M, N = act.shape[0], wgt.shape[0]
+    bn = SQ_TILES[0][1]
+    if M % 16 or N % bn:
+        return f"M={M}, N={N} needs M % 16 == 0 and N % {bn} == 0"
+    H, dev = N // 2, act.device
+    if qout.dtype != torch.uint8 or qout.dim() != 2 or qout.shape[0] < M or qout.shape[1] != H // 2:
+        return f"qout shape/dtype {tuple(qout.shape)} {qout.dtype}"
+    if qout.stride(-1) != 1 or qout.stride(0) % 4 or qout.data_ptr() % 4 or qout.device != dev:
+        return "qout rows not 4-byte aligned"
+    if oscales.dim() != 2 or oscales.shape[0] != H // 64 or oscales.shape[1] < M or oscales.stride(-1) != 1:
+        return f"oscales shape {tuple(oscales.shape)}"
+    if oscales.device != dev:
+        return "tensors on different devices"
+    if smooth is not None and (smooth.dtype != T or smooth.numel() != H or not smooth.is_contiguous() or smooth.device != dev):
+        return "smooth_factor must be a contiguous (H,) tensor of the output dtype"
+    if (lora_down is None) != (lora_act_out is None):
+        return "lora_down and lora_act_out must be given together"
+    if lora_down is not None:
+        R2 = lora_down.shape[1]
+        if lora_down.dtype != T or lora_down.dim() != 2 or lora_down.shape[0] != H or R2 % 16 or R2 == 0:
+            return f"lora_down shape/dtype {tuple(lora_down.shape)} {lora_down.dtype}"
+        if not _aligned(lora_down, 8) or lora_down.device != dev:
+            return "lora_down rows not 16-byte aligned"
+        if lora_act_out.dtype != torch.float32 or lora_act_out.dim() != 2 or lora_act_out.shape[0] < M:
+            return "lora_act_out must be (>= M, R2) fp32"
+        if lora_act_out.shape[1] != R2 or lora_act_out.device != dev:
+            return "lora_act_out shape"
+    return None
+
+
+def interleave_swiglu(n: int, device=None) -> torch.Tensor:
+    """
+    Row order for a SwiGLU projection whose output is ``[gate (n/2) | up (n/2)]``:
+    interleaved row ``32 b + w`` is gate row ``16 b + w`` for ``w < 16``, else up
+    row ``16 b + w - 16``. ``weight[idx]`` gives the layout the SwiGLU epilogue
+    reads; ``out.view(M, n // 32, 2, 16)`` un-interleaves an output (``[:, :, 0]``
+    gate, ``[:, :, 1]`` up).
+    """
+    h, b = n // 2, SWIGLU_BLOCK
+    g = torch.arange(h, device=device).view(h // b, b)
+    return torch.stack([g, g + h], dim=1).reshape(-1)
+
+
 def _kernel_name(dtype: torch.dtype, act_unsigned: bool, tile: tuple[int, int, int, int], name: str = "w4a4") -> str:
     bm, bn, wm, wn = tile
     return f"{name}_{_DTYPES[dtype]}_{'u' if act_unsigned else 's'}_{bm}x{bn}_{wm}x{wn}"
@@ -365,7 +428,7 @@ class _Kernels:
         self._run("w4a4qk", out.dtype, act_unsigned, tile or QK_TILES[0], M, N, (g, e))
 
     def launch_gelu_quant(self, act, wgt, out, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth,
-                          lora_down, lora_act_out, act_unsigned, shift=GELU_SHIFT, tile=None) -> None:
+                          lora_down, lora_act_out, act_unsigned, shift=GELU_SHIFT, tile=None, name="w4a4gq") -> None:
         M, N = act.shape[0], wgt.shape[0]
         tile = tile or GQ_TILES[0]
         bn = tile[1]
@@ -388,9 +451,14 @@ class _Kernels:
             part.stride(1) if R2 else 0,
             shift,
         )
-        self._run("w4a4gq", oscales.dtype, act_unsigned, tile, M, N, (g, e))
+        self._run(name, oscales.dtype, act_unsigned, tile, M, N, (g, e))
         if R2:
             torch.sum(part, dim=0, out=lora_act_out[:M])
+
+    def launch_swiglu_quant(self, act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth,
+                            lora_down, lora_act_out, act_unsigned, tile=None) -> None:
+        self.launch_gelu_quant(act, wgt, None, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth,
+                               lora_down, lora_act_out, act_unsigned, 0.0, tile or SQ_TILES[0], "w4a4sq")
 
     def _self_test(self) -> None:
         """Run every kernel once on a small odd-shaped problem and compare with a torch reference."""
@@ -419,6 +487,46 @@ class _Kernels:
                         )
         self._self_test_qk(g)
         self._self_test_gelu_quant(g)
+        self._self_test_swiglu_quant(g)
+
+    def _self_test_swiglu_quant(self, g) -> None:
+        dev = torch.device("cuda", self.device)
+        M, N, K, R, R2 = 144, 256, 256, 16, 48  # a partial M tile, two N tiles, two LoRA-down slabs
+        H = N // 2
+        act = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device=dev, generator=g)
+        wgt = torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device=dev, generator=g)
+        lora_act = torch.randn(M, R, device=dev, generator=g)
+        idx = interleave_swiglu(N, dev)
+        for dtype in _DTYPES:
+            asc = (torch.rand(K // 64, M, device=dev, generator=g) * 0.02 + 0.01).to(dtype)
+            wsc = (torch.rand(K // 64, N, device=dev, generator=g) * 0.02 + 0.01).to(dtype)
+            bias = torch.randn(N, device=dev, generator=g).to(dtype)
+            lora_up = (torch.randn(N, R, device=dev, generator=g) * 0.1).to(dtype)
+            smooth = (torch.rand(H, device=dev, generator=g) + 0.5).to(dtype)
+            lora_down = (torch.randn(H, R2, device=dev, generator=g) * 0.1).to(dtype)
+            for unsigned in (False, True):
+                lin = reference(act, wgt, asc, wsc, bias, lora_act, lora_up, unsigned)  # [gate | up] order
+                q_ref, s_ref, l_ref = reference_swiglu_quant(lin, smooth, lora_down, dtype)
+                for tile in SQ_TILES:
+                    name = _kernel_name(dtype, unsigned, tile, "w4a4sq")
+                    qout = torch.zeros(M + 16, H // 2, dtype=torch.uint8, device=dev)
+                    osc = torch.empty(H // 64, M, dtype=dtype, device=dev)
+                    lao = torch.empty(M, R2, device=dev)
+                    self.launch_swiglu_quant(act, wgt[idx], asc, wsc[:, idx].contiguous(), bias[idx], lora_act,
+                                             lora_up[idx], qout, osc, smooth, lora_down, lao, unsigned, tile=tile)
+                    codes = _unpack(qout[:M], True)
+                    bad = [
+                        what
+                        for what, ok in (
+                            ("oscales", ((osc.float() - s_ref).abs() <= 1e-2 * s_ref.abs() + 1e-6).all().item()),
+                            ("codes", (codes - q_ref).abs().max().item() <= 1 and (codes != q_ref).float().mean() < 1e-2),
+                            ("lora_act_out", (lao - l_ref).abs().max().item() <= 1e-2 * l_ref.abs().max().item()),
+                            ("rows past M", (qout[M:] == 0).all().item()),
+                        )
+                        if not ok
+                    ]
+                    if bad:
+                        raise RuntimeError(f"self-test failed for {name}: {', '.join(bad)}")
 
     def _self_test_qk(self, g) -> None:
         dev = torch.device("cuda", self.device)
@@ -537,6 +645,19 @@ def reference_gelu_quant(lin: torch.Tensor, smooth, lora_down, dtype, shift: flo
     return codes, scale.T, lora
 
 
+def reference_swiglu_quant(lin: torch.Tensor, smooth, lora_down, dtype):
+    """fp32 SwiGLU (``lin`` = [gate | up]) + LoRA-down + signed int4 quantization: (codes, scales, lora_act)."""
+    M, N = lin.shape
+    H = N // 2
+    y = torch.nn.functional.silu(lin[:, :H].float()) * lin[:, H:].float()
+    lora = y.to(dtype).float() @ lora_down.float() if lora_down is not None else None
+    v = y / (smooth.float() if smooth is not None else 1.0)
+    scale = v.view(M, H // 64, 64).abs().amax(-1) / 7
+    q = v.view(M, H // 64, 64) / torch.where(scale == 0, 1.0, scale)[..., None]
+    codes = torch.round(q).clamp(-8, 7).to(torch.int32).view(M, H)
+    return codes, scale.T, lora
+
+
 _lock = threading.Lock()
 _state: dict[int, "_Kernels | BaseException"] = {}
 
@@ -633,6 +754,20 @@ def gemm_gelu_quant(act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, o
     )
 
 
+def gemm_swiglu_quant(act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down,
+                      lora_act_out, act_unsigned=False, tile=None):
+    """The native GEMM with the fused SwiGLU + LoRA-down + signed int4 quantization epilogue, directly."""
+    reason = unsupported_reason_swiglu_quant(
+        act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down, lora_act_out
+    )
+    if reason is not None:
+        raise ValueError(f"native W4A4 SwiGLU-quant GEMM does not support this call: {reason}")
+    _kernels(_device(act), force=True).launch_swiglu_quant(
+        act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down, lora_act_out,
+        act_unsigned, tile=tile,
+    )
+
+
 def _device(t: torch.Tensor) -> int:
     return t.device.index if t.device.index is not None else torch.cuda.current_device()
 
@@ -702,4 +837,17 @@ def try_gemm_gelu_quant(act, wgt, out, ascales, wscales, bias, lora_act, lora_up
         ),
         lambda k: k.launch_gelu_quant(act, wgt, out, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth,
                                       lora_down, lora_act_out, act_unsigned),
+    )
+
+
+def try_gemm_swiglu_quant(act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down,
+                          lora_act_out, act_unsigned) -> bool:
+    """:func:`gemm_swiglu_quant` if enabled and supported, else ``False`` (run Triton)."""
+    return _try(
+        act,
+        lambda: unsupported_reason_swiglu_quant(
+            act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth, lora_down, lora_act_out
+        ),
+        lambda k: k.launch_swiglu_quant(act, wgt, ascales, wscales, bias, lora_act, lora_up, qout, oscales, smooth,
+                                        lora_down, lora_act_out, act_unsigned),
     )

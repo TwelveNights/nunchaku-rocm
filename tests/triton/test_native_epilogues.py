@@ -377,3 +377,99 @@ def test_unsupported_reason_fused_checks():
     assert native.unsupported_reason_gelu_quant(*gq, qout[:, :8], osc, sm, ld, lao) is not None
     assert native.unsupported_reason_gelu_quant(*gq, qout, osc, sm, ld[:, :8], lao[:, :8]) is not None  # R2 % 16
     assert native.unsupported_reason_gelu_quant(*gq, qout, osc, sm.half(), ld, lao) is not None
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# SwiGLU + signed int4 quantize (FLUX.2 [klein] MLP input projections), gemm_w4a4(..., fuse_swiglu=True)
+
+
+def _swiglu_problem(M, N, K, dtype, R2=32, seed=0, bias=False):
+    """[gate | up] problem plus its interleaved copy; quantization parameters are for the (M, N/2) result."""
+    act, wgt, asc, wsc, b, la, lu = _problem(M, N, K, dtype, seed=seed, bias=bias)
+    idx = native.interleave_swiglu(N, "cuda")
+    inter = (wgt[idx].contiguous(), wsc[:, idx].contiguous(), b[idx] if b is not None else None, lu[idx].contiguous())
+    sm, ld = _gq_inputs(N // 2, R2, dtype, seed=seed)
+    return act, (wgt, wsc, b, lu), inter, asc, la, sm, ld
+
+
+def _swiglu_call(act, inter, asc, la, sm, ld, M, H, dtype, R2):
+    wgt_i, wsc_i, b_i, lu_i = inter
+    lao = torch.empty(M + 16, R2, device="cuda")
+    qout = torch.zeros(M + 16, H // 2, dtype=torch.uint8, device="cuda")
+    osc = torch.empty(H // 64, M + 16, dtype=dtype, device="cuda")
+    r = w4a4.gemm_w4a4(act, wgt_i, ascales=asc, wscales=wsc_i, bias=b_i, lora_act_in=la, lora_up=lu_i, qout=qout,
+                       oscales=osc, smooth_factor=sm, lora_down=ld, lora_act_out=lao, out_dtype=dtype, fuse_swiglu=True)
+    assert r is None
+    return qout, osc, lao
+
+
+def test_interleave_swiglu_roundtrip():
+    N = 192
+    idx = native.interleave_swiglu(N)
+    assert sorted(idx.tolist()) == list(range(N))
+    x = torch.arange(N)[idx].view(1, N // 32, 2, 16)
+    assert torch.equal(x[:, :, 0].reshape(-1), torch.arange(N // 2))  # gate
+    assert torch.equal(x[:, :, 1].reshape(-1), torch.arange(N // 2, N))  # up
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_swiglu_fallback_matches_unfused(native_env, dtype):
+    """Any GPU: with the native path off, fuse_swiglu is bit-identical to the unfused model path (GEMM on the
+    [gate | up] weights, Flux2SwiGLU, then the activation quantizer)."""
+    native_env.setenv("NUNCHAKU_NATIVE_GEMM", "0")
+    M, N, K, R2 = 264, 512, 384, 32
+    act, (wgt, wsc, b, lu), inter, asc, la, sm, ld = _swiglu_problem(M, N, K, dtype, bias=True)
+    qf, sf, lf = _swiglu_call(act, inter, asc, la, sm, ld, M, N // 2, dtype, R2)
+    x = w4a4.gemm_w4a4(act, wgt, ascales=asc, wscales=wsc, bias=b, lora_act_in=la, lora_up=lu, out_dtype=dtype)
+    y = torch.nn.functional.silu(x[:, : N // 2]) * x[:, N // 2 :]
+    qu, su, lu_out = w4a4.quantize_w4a4_act_fuse_lora(y, lora_down=ld, smooth=sm)
+    assert torch.equal(qf[:M], qu[:M]) and torch.equal(sf[:, :M], su[:, :M]) and torch.equal(lf[:M], lu_out[:M])
+
+
+SQ_SHAPES = [(4608, 18432, 3072), (512, 18432, 3072), (4096, 24576, 4096), (144, 256, 256)]  # klein 4B / 9B, odd
+
+
+@requires_gfx11
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("M,N,K", SQ_SHAPES)
+def test_swiglu_quant_vs_unfused_and_fp64(native_env, dtype, M, N, K):
+    """Native fused vs the unfused path (which rounds the GEMM output and the SwiGLU result to 16 bits first) and an
+    fp64 reference: the native error is no larger; codes agree up to those roundings."""
+    H, R2 = N // 2, 32
+    act, (wgt, wsc, b, lu), inter, asc, la, sm, ld = _swiglu_problem(M, N, K, dtype)
+    qn, sn, ln = _swiglu_call(act, inter, asc, la, sm, ld, M, H, dtype, R2)
+    qn2, sn2, ln2 = _swiglu_call(act, inter, asc, la, sm, ld, M, H, dtype, R2)
+    assert torch.equal(qn, qn2) and torch.equal(sn[:, :M], sn2[:, :M]) and torch.equal(ln[:M], ln2[:M]), (
+        "not deterministic"
+    )
+    assert (qn[M:] == 0).all(), "qout rows past M were written"
+    native_env.setenv("NUNCHAKU_NATIVE_GEMM", "0")
+    qt, st, lt = _swiglu_call(act, inter, asc, la, sm, ld, M, H, dtype, R2)
+
+    rows = _rows(M, M)
+    lin = _lin64(act, wgt, asc, wsc, b, la, lu, rows)
+    y = torch.nn.functional.silu(lin[:, :H]) * lin[:, H:]
+    lref = y @ ld.double()
+    v = y / sm.double()
+    def deq_err(q, s):  # noqa: E306
+        c = _unpack(q[rows], True).double().view(len(rows), H // 64, 64) * s[:, rows].T.double()[..., None]
+        return ((c.reshape(len(rows), H) - v).pow(2).mean().sqrt() / v.pow(2).mean().sqrt()).item()
+    def lerr(l):  # noqa: E306, E741
+        return ((l[rows].double() - lref).abs().max() / lref.abs().max()).item()
+    d_n, d_t = deq_err(qn, sn), deq_err(qt, st)
+    assert d_n <= 1.001 * d_t, f"dequantization error: native {d_n:.5f} vs unfused {d_t:.5f}"
+    assert lerr(ln) <= 1.05 * lerr(lt) + 1e-6, f"lora_act_out error: native {lerr(ln):.3g} vs unfused {lerr(lt):.3g}"
+    cn, ct = _unpack(qn[:M], True), _unpack(qt[:M], True)
+    assert (cn - ct).abs().max().item() <= 1
+    assert (cn != ct).float().mean().item() < 0.02  # the unfused path's 16-bit roundings move values across midpoints
+
+
+@requires_gfx11
+def test_dispatch_swiglu_goes_native(native_env):
+    calls = _spy(native_env, "try_gemm_swiglu_quant")
+    M, N, K = 256, 512, 256
+    act, _, inter, asc, la, sm, ld = _swiglu_problem(M, N, K, torch.bfloat16)
+    _swiglu_call(act, inter, asc, la, sm, ld, M, N // 2, torch.bfloat16, 32)
+    native_env.setenv("NUNCHAKU_NATIVE_GEMM", "0")
+    _swiglu_call(act, inter, asc, la, sm, ld, M, N // 2, torch.bfloat16, 32)
+    assert calls == [True, False]

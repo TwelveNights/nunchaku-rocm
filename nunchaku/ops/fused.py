@@ -80,6 +80,70 @@ def fused_gelu_mlp(x: torch.Tensor, fc1: SVDQW4A4Linear, fc2: SVDQW4A4Linear, pa
     return output
 
 
+def interleave_swiglu_linear_(linear: SVDQW4A4Linear) -> None:
+    """
+    Reorder a SwiGLU input projection's output rows in place for :func:`fused_swiglu_mlp`: ``[gate | up]`` becomes
+    16-row blocks of gate and up (see ``nunchaku.ops.triton.native.w4a4.interleave_swiglu``), so the native GEMM
+    epilogue finds each gate value next to its up value. Triton backend, int4 only, natural layout (after
+    ``convert_svdq_linear_to_natural_layout``); call once.
+    """
+    from .triton.native.w4a4 import interleave_swiglu
+
+    assert linear.precision != "nvfp4" and linear.out_features % 64 == 0
+    idx = interleave_swiglu(linear.out_features, linear.qweight.device)
+    with torch.no_grad():
+        linear.qweight.data = linear.qweight.data[idx].contiguous()
+        linear.wscales.data = linear.wscales.data[:, idx].contiguous()
+        linear.proj_up.data = linear.proj_up.data[idx].contiguous()
+        if linear.bias is not None:
+            linear.bias.data = linear.bias.data[idx].contiguous()
+
+
+def fused_swiglu_mlp(x: torch.Tensor, fc1: SVDQW4A4Linear, fc2: SVDQW4A4Linear, pad_size: int = 256) -> torch.Tensor:
+    """
+    Quantized SwiGLU MLP, ``fc2(silu(gate) * up)`` with ``[gate | up] = fc1(x)`` (FLUX.2's ``Flux2FeedForward``), with
+    the SwiGLU and fc2's activation quantization fused into fc1's GEMM. ``fc1``'s rows must have been reordered by
+    :func:`interleave_swiglu_linear_`. Triton backend only (int4, signed fc2 activations).
+
+    Parameters
+    ----------
+    x : torch.Tensor, shape (B, S, C_in) (or (M, C_in))
+    fc1 : SVDQW4A4Linear, (C_in -> 2H), interleaved
+    fc2 : SVDQW4A4Linear, (H -> C_out)
+    """
+    from .triton.gemm_w4a4 import gemm_w4a4
+
+    shape = x.shape
+    x = x.reshape(-1, shape[-1])
+    M = x.shape[0]
+    quantized_x, ascales, lora_act = fc1.quantize(x, pad_size=pad_size)
+    M_pad = quantized_x.shape[0]
+    H = fc2.in_features
+    qout_act = torch.empty(M_pad, H // 2, dtype=torch.uint8, device=x.device)
+    qout_ascales = torch.empty(H // 64, M_pad, dtype=x.dtype, device=x.device)
+    qout_lora_act = torch.empty(M_pad, fc2.proj_down.shape[1], dtype=torch.float32, device=x.device)
+    gemm_w4a4(
+        act=quantized_x,
+        wgt=fc1.qweight,
+        ascales=ascales,
+        wscales=fc1.wscales,
+        bias=fc1.bias,
+        lora_act_in=lora_act,
+        lora_up=fc1.proj_up,
+        qout=qout_act,
+        oscales=qout_ascales,
+        smooth_factor=fc2.smooth_factor,
+        lora_down=fc2.proj_down,
+        lora_act_out=qout_lora_act,
+        act_unsigned=fc1.act_unsigned,
+        out_dtype=x.dtype,
+        fuse_swiglu=True,
+    )
+    output = torch.empty(M, fc2.out_features, dtype=x.dtype, device=x.device)
+    output = fc2.forward_quant(qout_act, qout_ascales, qout_lora_act, output=output)
+    return output.view(*shape[:-1], fc2.out_features)
+
+
 def fused_qkv_norm_rottary(
     x: torch.Tensor,
     proj: SVDQW4A4Linear,
