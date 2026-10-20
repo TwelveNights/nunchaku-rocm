@@ -30,6 +30,9 @@ GPUs (which have no NVIDIA-only mma.m16n8k32-based CUDA extension):
     instruction that Triton cannot emit, compiled at runtime with hipRTC
     and launched through the HIP runtime via ctypes; the Triton kernel
     remains the fallback and the path on every other GPU.
+  - ComfyUI custom nodes (comfyui/) that load Nunchaku FLUX.1 and FLUX.2
+    checkpoints as ComfyUI models through a thin adapter on ComfyUI's own
+    FLUX model code (ComfyUI itself is not included).
 
 On the `main` branch, no changes were made to the original CUDA kernels,
 C++ extension, or any other part of the upstream project; that branch adds

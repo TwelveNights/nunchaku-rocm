@@ -20,8 +20,10 @@
 > links.
 >
 > See **[`nunchaku/ops/triton/README.md`](nunchaku/ops/triton/README.md)** for
-> what's implemented, kernel benchmarks, and known gaps. Everything below this
-> point is the original upstream README, otherwise unmodified.
+> what's implemented, kernel benchmarks, and known gaps, and
+> **[`comfyui/README.md`](comfyui/README.md)** for the ComfyUI nodes (FLUX.1,
+> FLUX.2 [klein] on AMD GPUs). Everything below this point is the original
+> upstream README, otherwise unmodified.
 
 ---
 
