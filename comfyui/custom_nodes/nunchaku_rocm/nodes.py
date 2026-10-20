@@ -141,5 +141,46 @@ class NunchakuDiTLoader:
         return (load_model(folder_paths.get_full_path_or_raise("diffusion_models", model_name)),)
 
 
-NODE_CLASS_MAPPINGS = {"NunchakuRocmDiTLoader": NunchakuDiTLoader}
-NODE_DISPLAY_NAME_MAPPINGS = {"NunchakuRocmDiTLoader": "Nunchaku DiT Loader (ROCm)"}
+class NunchakuLoraLoader:
+    """
+    Add a LoRA to a model from :class:`NunchakuDiTLoader` (chain several for multiple LoRAs). ComfyUI's own
+    LoraLoader cannot patch the 4-bit layers; this one appends the LoRA to them at sampling time.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {"tooltip": "A model from Nunchaku DiT Loader (ROCm)"}),
+                "lora_name": (folder_paths.get_filename_list("loras"),),
+                "strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "Nunchaku (ROCm)"
+    DESCRIPTION = (
+        "Applies a FLUX.1 / FLUX.2 [klein] LoRA (ComfyUI/BFL, kohya or diffusers format) to a Nunchaku model."
+    )
+
+    def load(self, model: comfy.model_patcher.ModelPatcher, lora_name: str, strength: float):
+        if not isinstance(model.model.diffusion_model, NunchakuFluxAdapter):
+            raise ValueError("Nunchaku LoRA Loader needs a model from Nunchaku DiT Loader (ROCm)")
+        return (add_lora(model, folder_paths.get_full_path_or_raise("loras", lora_name), strength),)
+
+
+def add_lora(model: comfy.model_patcher.ModelPatcher, path: str, strength: float) -> comfy.model_patcher.ModelPatcher:
+    """A clone of a Nunchaku ``MODEL`` that also applies the LoRA at ``path`` (see adapter._apply_loras)."""
+    out = model.clone()
+    topts = dict(out.model_options.get("transformer_options", {}))
+    topts["nunchaku_loras"] = [*topts.get("nunchaku_loras", []), (path, float(strength))]
+    out.model_options = {**out.model_options, "transformer_options": topts}
+    return out
+
+
+NODE_CLASS_MAPPINGS = {"NunchakuRocmDiTLoader": NunchakuDiTLoader, "NunchakuRocmLoraLoader": NunchakuLoraLoader}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "NunchakuRocmDiTLoader": "Nunchaku DiT Loader (ROCm)",
+    "NunchakuRocmLoraLoader": "Nunchaku LoRA Loader (ROCm)",
+}

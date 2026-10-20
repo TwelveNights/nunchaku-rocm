@@ -3,8 +3,9 @@
 Run Nunchaku 4-bit SVDQuant models in [ComfyUI](https://github.com/comfyanonymous/ComfyUI) on AMD GPUs,
 with this repo's Triton backend (and its native int4 kernels on RDNA3 / gfx11).
 
-One node, **Nunchaku DiT Loader (ROCm)** (`NunchakuRocmDiTLoader`, category *Nunchaku (ROCm)*), loads a
-Nunchaku checkpoint as a ComfyUI `MODEL`. Everything else is stock ComfyUI: its own text-encoder, VAE,
+Two nodes (category *Nunchaku (ROCm)*): **Nunchaku DiT Loader (ROCm)** (`NunchakuRocmDiTLoader`) loads a
+Nunchaku checkpoint as a ComfyUI `MODEL`, and **Nunchaku LoRA Loader (ROCm)** (`NunchakuRocmLoraLoader`)
+adds a LoRA to it (chain several for multiple LoRAs). Everything else is stock ComfyUI: its own text-encoder, VAE,
 sampler, scheduler and reference-latent nodes. Under the hood the loader builds ComfyUI's FLUX.1 /
 FLUX.2 model config and swaps in a thin adapter (`custom_nodes/nunchaku_rocm/adapter.py`) that reuses
 ComfyUI's latent packing, reference-latent handling and RoPE position ids and only replaces the
@@ -24,9 +25,31 @@ and `-9b` (`split_files/…`), `comfyanonymous/flux_text_encoders`, and `ae.safe
 `black-forest-labs/FLUX.1-schnell`. Use INT4 checkpoints: no AMD GPU has FP4 matrix units, so NVFP4 files
 run on an emulated path.
 
-Not supported yet: ControlNet, LoRA, model-patching nodes that replace transformer blocks (they are
+Not supported yet: ControlNet, model-patching nodes that replace transformer blocks (they are
 ignored with a warning), the `index_timestep_zero` reference method, Qwen-Image / Z-Image / SDXL
 Nunchaku models.
+
+## LoRA
+
+Use **Nunchaku LoRA Loader (ROCm)** -- ComfyUI's own LoraLoader patches full-precision weights by name and
+cannot reach the 4-bit layers. FLUX.1 and FLUX.2 [klein] LoRAs in ComfyUI / BFL (`diffusion_model.double_blocks...`),
+kohya (`lora_unet_...`) and diffusers / PEFT (`transformer.transformer_blocks...`) format all work; text-encoder
+weights in a LoRA file are ignored. The loader is implemented by `nunchaku.lora.runtime.set_loras` (usable
+from Python too): on the 4-bit SVDQuant layers the LoRA is appended to the layer's existing 16-bit low-rank
+branch (no extra kernels; ~0.3 s per Klein 4B image on the RX 7800 XT), other layers get a small hook. Switching
+LoRAs or strengths between runs re-applies them in a fraction of a second; MODEL branches with and without
+LoRAs can share one loaded model.
+
+Checked against ComfyUI's own LoRA loading on its bf16 model (`scripts/check_lora.py`, MI300X):
+
+| LoRA (format) | Model | Image PSNR, ours+LoRA vs bf16+LoRA | bf16+LoRA vs bf16 without |
+| --- | --- | --- | --- |
+| Norod78 old-gods (ComfyUI/BFL, r32) | Klein 4B | 17.4 dB | 13.0 dB |
+| Shakker-Labs Logo-Design (kohya, r4) | FLUX.1-schnell | 19.8 dB | 16.4 dB |
+| alvdansen softserve_anime (diffusers, r64) | FLUX.1-schnell | 15.0 dB | 7.3 dB |
+
+In every case the LoRA's effect (style / subject change) is reproduced; the per-image gap is the usual 4-bit
+one. `workflows/flux.2-klein-4b-lora.json` is a Klein example (LoRA in `models/loras`).
 
 ## Install
 
@@ -51,7 +74,7 @@ Nunchaku models.
 
 3. Load a workflow from [`workflows/`](workflows) (API format; drag it into ComfyUI or submit it to
    `/prompt`): `flux.2-klein-4b.json`, `flux.2-klein-9b.json`, `flux.2-klein-4b-edit.json` (reference
-   image editing; put the image in ComfyUI's `input/`), `flux.1-schnell.json`.
+   image editing; put the image in ComfyUI's `input/`), `flux.2-klein-4b-lora.json`, `flux.1-schnell.json`.
 
 On Windows, keep the native kernels' compile caches out of `%LOCALAPPDATA%` if you like by setting
 `NUNCHAKU_CACHE_DIR` and `AMD_COMGR_CACHE_DIR` (see `nunchaku/ops/triton/README.md`).
