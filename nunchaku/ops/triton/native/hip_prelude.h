@@ -18,6 +18,7 @@
 #define EXTC extern "C"
 
 typedef int v2i __attribute__((ext_vector_type(2)));
+typedef float v2f __attribute__((ext_vector_type(2)));
 typedef int v4i __attribute__((ext_vector_type(4)));
 typedef int v8i __attribute__((ext_vector_type(8)));
 typedef float v4f __attribute__((ext_vector_type(4)));

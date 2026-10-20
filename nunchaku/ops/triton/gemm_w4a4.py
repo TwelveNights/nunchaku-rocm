@@ -60,11 +60,12 @@ over the stored output.
 
 Native RDNA3 path
 -----------------
-On gfx11 GPUs, int4 calls without a fused epilogue (bias / LoRA-up only) run
-the hand-written ``v_wmma_i32_16x16x16_iu4`` kernel in ``native/`` instead
-(about 2x this kernel's speed), when it supports the shapes and dtypes;
-everything else stays here. ``NUNCHAKU_NATIVE_GEMM=0`` disables it. See
-:mod:`.native.w4a4`.
+On gfx11 GPUs, int4 calls run the hand-written ``v_wmma_i32_16x16x16_iu4``
+kernels in ``native/`` instead (about 2x this kernel's speed) when they
+support the shapes and dtypes: plain calls (bias / LoRA-up only), the fused
+Q/K RMSNorm + RoPE epilogue, and the fused GELU + next-layer-quantize
+epilogue; everything else (NVFP4, SiLU, ...) stays here.
+``NUNCHAKU_NATIVE_GEMM=0`` disables them. See :mod:`.native.w4a4`.
 """
 
 import torch
@@ -959,22 +960,27 @@ def gemm_w4a4(
     has_lora = lora_act_in is not None and lora_up is not None
     R = lora_up.shape[1] if has_lora else 0
 
-    # Plain int4 GEMMs (bias / LoRA-up only) go to the hand-written int4-WMMA
-    # kernel on RDNA3 when it supports the call; see native/w4a4.py.
+    # Int4 GEMMs go to the hand-written int4-WMMA kernels on RDNA3 when they
+    # support the call (see native/w4a4.py): plain (bias / LoRA-up only), the
+    # QKV projection's fused RMSNorm + RoPE, and the fused GELU + next-layer
+    # quantization of an MLP's fc1.
     want_qk = norm_q is not None or norm_k is not None or rotary_emb is not None
-    if (
-        not fp4
-        and wcscales is None
-        and (alpha is None or alpha == 1.0)
-        and not want_qk
-        and not want_quant
-        and not fuse_silu
-        and _native_w4a4.try_gemm(
-            act, wgt, out2d, ascales, wscales, bias,
-            lora_act_in if has_lora else None, lora_up if has_lora else None, act_unsigned,
-        )
-    ):
-        return out
+    native_ok = not fp4 and wcscales is None and (alpha is None or alpha == 1.0) and not fuse_silu
+    la_n, lu_n = (lora_act_in, lora_up) if has_lora else (None, None)
+    if native_ok and not want_qk and not want_quant:
+        if _native_w4a4.try_gemm(act, wgt, out2d, ascales, wscales, bias, la_n, lu_n, act_unsigned):
+            return out
+    elif native_ok and want_qk and not want_quant:
+        if _native_w4a4.try_gemm_qk(
+            act, wgt, out2d, ascales, wscales, bias, la_n, lu_n, norm_q, norm_k, rotary_emb, act_unsigned
+        ):
+            return out
+    elif fuse_quant:
+        if _native_w4a4.try_gemm_gelu_quant(
+            act, wgt, out2d, ascales, wscales, bias, la_n, lu_n, qout.reshape(-1, qout.shape[-1]), oscales,
+            smooth_factor, lora_down, lora_act_out, act_unsigned,
+        ):
+            return out
 
     if fuse_quant:
         _launch_gemm_int4_gelu_quant(

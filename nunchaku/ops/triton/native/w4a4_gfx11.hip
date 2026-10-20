@@ -19,8 +19,12 @@
 // operand that is read in 16-byte vectors (act, wgt, ascales, wscales, lora_act, lora_up).
 //
 // Structure: gemm_w4a4<Tile, A_SIGNED, T, Epi> = LDS-staged main loop -> lora_up_bias -> Epi::apply. The epilogue
-// gets the fp32 accumulator tile plus its coordinates (TileCtx) and the LDS buffer, so a fused epilogue (QK
-// RMSNorm + RoPE, next-layer quantization, ...) slots in as another Epi without touching the main loop.
+// gets the fp32 accumulator tile plus its coordinates (TileCtx) and the LDS buffer, so a fused epilogue slots in as
+// another Epi without touching the main loop. Three are instantiated:
+//   StoreEpilogue      plain GEMM: round to T and store
+//   QKNormRopeEpilogue QKV projection: per-head RMSNorm + RoPE on the Q and K thirds of N, then store
+//   GeluQuantEpilogue  MLP fc1: GELU, the next layer's LoRA-down, and its unsigned int4 activation quantization;
+//                      the 16-bit output itself is optional
 #include "hip_prelude.h"
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -91,6 +95,8 @@ struct Tile {
 template <int TM, int TN>
 struct TileCtx {
   int m0, n0;        // wave tile origin in the output
+  int bm0, bn0;      // workgroup tile origin in the output
+  int tid, wave;     // thread index in the workgroup, wave index (wave-uniform)
   int r16, hl;       // lane % 16, lane / 16
   int ncol[TN];      // col(j) clamped into [0, N) -- safe to load per-column operands with
   unsigned char* smem;  // the main loop's LDS staging buffer, free for the epilogue after a syncthreads()
@@ -149,16 +155,25 @@ static __device__ __forceinline__ void lora_up_bias(const GemmArgs& g, v8f (&acc
 
 // ---------------------------------------------------------------------------------------------------------------
 // Epilogue stage 2. An epilogue is a type with
-//   struct Args { ... };   (its own kernel argument, after GemmArgs; omitted from the signature when empty)
-//   template <class T, int TM, int TN>
-//   static void apply(const GemmArgs&, const Args&, v8f (&acc)[TM][TN], const TileCtx<TM, TN>&);
+//   struct Args { ... };   (its own kernel argument, after GemmArgs)
+//   template <class Tl> static constexpr int lds_bytes();   LDS it needs (the stage buffer is reused; may be larger)
+//   template <class T, class Tl>
+//   static void apply(const GemmArgs&, const Args&, v8f (&acc)[Tl::TM][Tl::TN], const TileCtx<Tl::TM, Tl::TN>&);
+// apply() is entered by all threads of the workgroup, right after the main loop's final barrier, so it may use
+// ctx.smem and syncthreads() (from workgroup-uniform control flow only).
 
 // Plain store: round to T, write the rows below actual_m (the activations may be padded past the output's rows).
 struct StoreEpilogue {
   struct Args {};
+  template <class Tl>
+  static constexpr int lds_bytes() { return 0; }
+  template <class T, class Tl>
+  static __device__ __forceinline__ void apply(const GemmArgs& g, const Args&, v8f (&acc)[Tl::TM][Tl::TN],
+                                               const TileCtx<Tl::TM, Tl::TN>& c) {
+    store<T>(g, acc, c);
+  }
   template <class T, int TM, int TN>
-  static __device__ __forceinline__ void apply(const GemmArgs& g, const Args&, v8f (&acc)[TM][TN],
-                                               const TileCtx<TM, TN>& c) {
+  static __device__ __forceinline__ void store(const GemmArgs& g, v8f (&acc)[TM][TN], const TileCtx<TM, TN>& c) {
 #pragma unroll
     for (int j = 0; j < TN; j++) {
       const int n = c.col(j);
@@ -195,7 +210,8 @@ static __device__ __forceinline__ void gemm_w4a4(const GemmArgs& g, const typena
   constexpr int A_PER = (A_CH + NT - 1) / NT, B_PER = (B_CH + NT - 1) / NT;
   static_assert(AS_CH + WS_CH <= NT, "one scale chunk per thread");
   static_assert(BM % 16 == 0 && BN % 16 == 0 && WM % 16 == 0 && WN % 16 == 0, "tile shape");
-  __shared__ __attribute__((aligned(16))) unsigned char smem[2 * BUF];
+  constexpr int EPI_LDS = Epi::template lds_bytes<Tl>();
+  __shared__ __attribute__((aligned(16))) unsigned char smem[2 * BUF > EPI_LDS ? 2 * BUF : EPI_LDS];
 
   // grouped tile order, as _tile_ids in the Triton kernel
   const int M = g.M, N = g.N;
@@ -369,6 +385,10 @@ static __device__ __forceinline__ void gemm_w4a4(const GemmArgs& g, const typena
   TileCtx<TM, TN> ctx;
   ctx.m0 = bm0 + wm0;
   ctx.n0 = bn0 + wn0;
+  ctx.bm0 = bm0;
+  ctx.bn0 = bn0;
+  ctx.tid = tid;
+  ctx.wave = wave;
   ctx.r16 = r16;
   ctx.hl = hl;
 #pragma unroll
@@ -380,25 +400,308 @@ static __device__ __forceinline__ void gemm_w4a4(const GemmArgs& g, const typena
   ctx.smem_bytes = (int)sizeof(smem);
 
   lora_up_bias<T>(g, acc, ctx);
-  Epi::template apply<T>(g, e, acc, ctx);
+  Epi::template apply<T, Tl>(g, e, acc, ctx);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Instantiations: w4a4_<bf16|fp16>_<s|u>_<BM>x<BN>_<WM>x<WN> (s/u = signed/unsigned activations). The host-side
-// tile table (w4a4.py: TILES) must list the same tiles.
+// Fused epilogues. Lane exchanges use DPP within rows of 16 lanes: quad_perm [1,0,3,2] (0xB1) swaps neighbouring
+// lanes, row_xmask:k (0x160 + k) reads lane ^ k.
 
-#define W4A4_STORE_KERNEL(DT, T, SU, SIGNED, BM, BN, WM, WN)                                                     \
-  EXTC __global__ void __launch_bounds__((BM / WM) * (BN / WN) * 32)                                             \
-      w4a4_##DT##_##SU##_##BM##x##BN##_##WM##x##WN(GemmArgs g) {                                                \
-    gemm_w4a4<Tile<BM, BN, WM, WN>, SIGNED, T, StoreEpilogue>(g, StoreEpilogue::Args{});                        \
+static __device__ __forceinline__ int f2i(float x) { return __builtin_bit_cast(int, x); }
+template <int CTRL>
+static __device__ __forceinline__ float dpp_f32(float x) {
+  return i2f(__builtin_amdgcn_update_dpp(0, f2i(x), CTRL, 0xf, 0xf, false));
+}
+template <int CTRL>
+static __device__ __forceinline__ int dpp_i32(int x) {
+  return __builtin_amdgcn_update_dpp(0, x, CTRL, 0xf, 0xf, false);
+}
+// butterfly reductions over the 16 lanes of a row: every lane ends up with the same (bitwise) value
+static __device__ __forceinline__ float sum16(float s) {
+  s += dpp_f32<0x161>(s);
+  s += dpp_f32<0x162>(s);
+  s += dpp_f32<0x164>(s);
+  s += dpp_f32<0x168>(s);
+  return s;
+}
+static __device__ __forceinline__ float max16(float s) {
+  s = __builtin_fmaxf(s, dpp_f32<0x161>(s));
+  s = __builtin_fmaxf(s, dpp_f32<0x162>(s));
+  s = __builtin_fmaxf(s, dpp_f32<0x164>(s));
+  s = __builtin_fmaxf(s, dpp_f32<0x168>(s));
+  return s;
+}
+
+// Per-head RMSNorm + RoPE on the Q and K thirds of a QKV projection (N = 3 * heads * 128), V untouched; then the
+// plain store. Same maths as _qk_rmsnorm_rope_tile in gemm_w4a4.py, applied to the fp32 tile before rounding:
+//   x = acc * rsqrt(mean(acc^2 over the head) + eps) * norm_w;  (x_2p, x_2p+1) rotated by (sin, cos) = rot[m, p].
+// BN == 128 so a workgroup holds exactly one head of one third (the host checks (N / 3) % 128 == 0).
+struct QKNormRopeEpilogue {
+  struct Args {
+    const u16* norm_q;  // (128,), T
+    const u16* norm_k;  // (128,), T
+    const float* rot;   // (actual_m, 64 pairs, (sin, cos)) fp32, 8-byte aligned rows
+    int stride_rm;      // rot row stride, in floats
+    float eps;
+  };
+  template <class Tl>
+  static constexpr int lds_bytes() { return Tl::WAVES_N * Tl::BM * 4; }
+
+  template <class T, class Tl>
+  static __device__ __forceinline__ void apply(const GemmArgs& g, const Args& e, v8f (&acc)[Tl::TM][Tl::TN],
+                                               const TileCtx<Tl::TM, Tl::TN>& c) {
+    constexpr int TM = Tl::TM, TN = Tl::TN, BM = Tl::BM, WAVES_N = Tl::WAVES_N;
+    static_assert(Tl::BN == 128, "one 128-wide head per workgroup");
+    const int part = c.bn0 / (g.N / 3);  // 0 Q, 1 K, 2 V -- uniform over the workgroup
+    if (part < 2) {
+      // sum of squares per row: lane-local over j, 16-lane butterfly, then the WAVES_N waves sharing the head
+      // through LDS, added in a fixed order (deterministic)
+      float* red = (float*)c.smem;  // [WAVES_N][BM]
+      const int wn = c.wave % WAVES_N, wm0 = c.m0 - c.bm0, wn0 = c.n0 - c.bn0;
+#pragma unroll
+      for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          float s = 0.0f;
+#pragma unroll
+          for (int j = 0; j < TN; j++) s = __builtin_fmaf(acc[t][j][i], acc[t][j][i], s);
+          s = sum16(s);
+          if (c.r16 == 0) red[wn * BM + wm0 + t * 16 + 2 * i + c.hl] = s;
+        }
+      syncthreads();
+      const u16* nw = part == 0 ? e.norm_q : e.norm_k;
+      float w[TN];
+#pragma unroll
+      for (int j = 0; j < TN; j++) w[j] = T::to_f32(nw[wn0 + j * 16 + c.r16]);
+      const bool odd = c.r16 & 1;
+#pragma unroll
+      for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          const int ml = wm0 + t * 16 + 2 * i + c.hl;
+          float s = 0.0f;
+#pragma unroll
+          for (int q = 0; q < WAVES_N; q++) s += red[q * BM + ml];
+          const float rstd = 1.0f / __builtin_sqrtf(s * (1.0f / 128.0f) + e.eps);
+          int m = c.bm0 + ml;
+          m = m < g.actual_m ? m : g.actual_m - 1;  // rot has actual_m rows; padded rows are not stored
+          const float* rp = e.rot + (long)m * e.stride_rm;
+#pragma unroll
+          for (int j = 0; j < TN; j++) {
+            const float x = acc[t][j][i] * rstd * w[j];
+            const float y = dpp_f32<0xB1>(x);  // pair partner = the neighbouring column = the neighbouring lane
+            const v2f sc = *(const v2f*)(rp + ((wn0 + j * 16 + c.r16) & ~1));  // (sin, cos) of this pair
+            const float xe = odd ? y : x, xo = odd ? x : y;
+            acc[t][j][i] = odd ? xe * sc.x + xo * sc.y : xe * sc.y - xo * sc.x;
+          }
+        }
+    }
+    StoreEpilogue::store<T>(g, acc, c);
   }
-#define W4A4_TILE(BM, BN, WM, WN)                              \
-  W4A4_STORE_KERNEL(bf16, BF16, s, true, BM, BN, WM, WN)       \
-  W4A4_STORE_KERNEL(bf16, BF16, u, false, BM, BN, WM, WN)      \
-  W4A4_STORE_KERNEL(fp16, FP16, s, true, BM, BN, WM, WN)       \
-  W4A4_STORE_KERNEL(fp16, FP16, u, false, BM, BN, WM, WN)
+};
+
+// tanh-approximate GELU, op for op as nunchaku.ops.triton._common.gelu_tanh is lowered by Triton on AMD
+// (exp(z) = exp2(z * log2 e)) so that the quantized codes match the Triton kernel's. 2 / d uses v_rcp_f32 plus one
+// residual step instead of the IEEE division sequence: correctly rounded except in rare cases (measured: the same
+// codes as the IEEE division at FLUX shapes). d is clamped so an overflowing exp still gives t = -1 exactly.
+static __device__ __forceinline__ float gelu_tanh(float x) {
+  const float inner = (x + ((0.044715f * x) * x) * x) * 0.79788456f;
+  const float ex = __builtin_exp2f((inner * -2.0f) * 1.44269504088896341f);
+  const float d = __builtin_fminf(ex + 1.0f, 8.5070592e37f);
+  const float r = __builtin_amdgcn_rcpf(d);
+  const float q0 = 2.0f * r;
+  const float t = __builtin_fmaf(__builtin_fmaf(-d, q0, 2.0f), r, q0) - 1.0f;
+  return (x * 0.5f) * (t + 1.0f);
+}
+
+// The fc1 epilogue of a GELU MLP (EpilogueGelu + EpilogueLoraDown + EpilogueQuantize of the CUDA kernel; same
+// maths as _gemm_w4a4_int4_gelu_quant_kernel in gemm_w4a4.py), on the fp32 tile:
+//   [out = acc]  x = gelu(acc)
+//   lora_part[pid_n, m, :] = T(x)[m, tile] @ lora_down[tile, :]      per-N-tile partial of the next layer's LoRA-down;
+//                                                                    the host sums the partials in a fixed order
+//   v = (x + shift) / smooth;  scale = max(max_64(v), 0) / 15;  code = clamp(rint(v / scale), 0, 15)  (unsigned int4)
+// Needs WN % 64 == 0 (a 64-wide quantization group lives in one wave) and M % 16 == 0, N % BN == 0 (host-checked).
+struct GeluQuantEpilogue {
+  struct Args {
+    unsigned char* qout;  // (>= M, N/2) packed codes
+    u16* oscales;         // (N/64, stride_osg), T
+    const u16* smooth;    // (N,), T; null: none
+    const u16* lora_down; // (N, R2), T; null: no LoRA-down
+    float* lora_part;     // (N/BN, M, R2) fp32
+    long long stride_lop; // lora_part stride of dim 0, in floats
+    int R2, stride_qm, stride_osg, stride_ld, stride_lom;
+    float shift;
+  };
+  static constexpr int XP_PAD = 8;  // LDS row pad (16-bit elements): keeps 16-byte rows, spreads banks
+  template <class Tl>
+  static constexpr int lds_bytes() { return (Tl::BM + 32) * (Tl::BN + XP_PAD) * 2; }
+
+  template <class T, class Tl>
+  static __device__ __forceinline__ void apply(const GemmArgs& g, const Args& e, v8f (&acc)[Tl::TM][Tl::TN],
+                                               const TileCtx<Tl::TM, Tl::TN>& c) {
+    constexpr int TM = Tl::TM, TN = Tl::TN, BM = Tl::BM, BN = Tl::BN, WN = Tl::WN, NT = Tl::THREADS;
+    constexpr int NW = NT / 32, XP = BN + XP_PAD;
+    static_assert(WN % 64 == 0, "quantization groups must not straddle waves");
+    const int M = g.M, r16 = c.r16, hl = c.hl, m0 = c.m0, n0 = c.n0;
+    const int wm0 = m0 - c.bm0, wn0 = n0 - c.bn0;
+
+    // issue the loads of the first 32-rank slab of lora_down[bn0 : bn0 + BN] now; they land during the GELU work
+    constexpr int LD_CH = BN * 4, LD_PER = (LD_CH + NT - 1) / NT;  // 16-byte (8-rank) chunks
+    v4i ldv[LD_PER];
+    auto load_ld = [&](int rc) {
+      const int rw = e.R2 - rc < 32 ? e.R2 - rc : 32;
+#pragma unroll
+      for (int q = 0; q < LD_PER; q++) {
+        const int ch = c.tid + q * NT, n = ch >> 2, h = ch & 3;
+        if (ch < LD_CH && h * 8 < rw) ldv[q] = *(const v4i*)(e.lora_down + (long)(c.bn0 + n) * e.stride_ld + rc + h * 8);
+      }
+    };
+    if (e.lora_down) load_ld(0);
+
+    if (g.out) StoreEpilogue::store<T>(g, acc, c);  // optional pre-GELU output
+
+    u16* xs = (u16*)c.smem;  // [BM][XP]  T(gelu(x)), the LoRA-down WMMA's A operand
+    u16* ldT = xs + BM * XP; // [32][XP]  lora_down[bn0 : bn0 + BN, rc : rc + 32]^T, its B operand
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+      for (int j = 0; j < TN; j++)
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          const float x = gelu_tanh(acc[t][j][i]);
+          acc[t][j][i] = x;
+          xs[(wm0 + t * 16 + 2 * i + hl) * XP + wn0 + j * 16 + r16] = T::from_f32(x);
+        }
+
+    // ---- quantize. Per row and 64-group: the group max is a lane-local max over 4 sub-tiles plus a 16-lane
+    // butterfly. 8 lanes (8 consecutive columns) OR their nibbles into one 32-bit word, which every lane of the
+    // group then holds for all 8 rows i; lane (r16 & 7) == i stores row i's (one store per lane, no masking).
+    // Likewise lanes r16 < 8 store the scale of row r16. M % 16 == 0: a 16-row slice is all in range or all padding.
+    float ism[TN];
+#pragma unroll
+    for (int j = 0; j < TN; j++) ism[j] = e.smooth ? 1.0f / T::to_f32(e.smooth[n0 + j * 16 + r16]) : 1.0f;
+    const int sh = 4 * (r16 & 7), sel = r16 & 7;
+    const unsigned q_lane = (unsigned)((2 * sel + hl) * e.stride_qm + ((n0 + (r16 & 8)) >> 1));
+#pragma unroll
+    for (int t = 0; t < TM; t++) {
+      if (m0 + t * 16 >= M) continue;  // wave-uniform
+      unsigned char* qrow = e.qout + (long)(m0 + t * 16) * e.stride_qm;
+#pragma unroll
+      for (int gg = 0; gg < WN / 64; gg++) {
+        float scl[8];
+        int wd[4][8];
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          float v[4];
+          float mx = -3.402823466e38f;
+#pragma unroll
+          for (int jj = 0; jj < 4; jj++) {
+            v[jj] = (acc[t][gg * 4 + jj][i] + e.shift) * ism[gg * 4 + jj];
+            mx = __builtin_fmaxf(mx, v[jj]);
+          }
+          mx = __builtin_fmaxf(max16(mx), 0.0f);
+          const float scale = mx / 15.0f;
+          const float inv = 1.0f / (scale == 0.0f ? 1.0f : scale);
+          scl[i] = scale;
+#pragma unroll
+          for (int jj = 0; jj < 4; jj++) {
+            float q = __builtin_rintf(v[jj] * inv);
+            q = __builtin_fminf(__builtin_fmaxf(q, 0.0f), 15.0f);
+            int w = ((int)q) << sh;
+            w |= dpp_i32<0x161>(w);
+            w |= dpp_i32<0x162>(w);
+            w |= dpp_i32<0x164>(w);
+            wd[jj][i] = w;
+          }
+        }
+        float s = scl[0];
+#pragma unroll
+        for (int i = 1; i < 8; i++) s = sel == i ? scl[i] : s;
+        if (r16 < 8) e.oscales[(long)((n0 >> 6) + gg) * e.stride_osg + m0 + t * 16 + 2 * sel + hl] = T::from_f32(s);
+#pragma unroll
+        for (int jj = 0; jj < 4; jj++) {
+          int w = wd[jj][0];
+#pragma unroll
+          for (int i = 1; i < 8; i++) w = sel == i ? wd[jj][i] : w;
+          *(int*)(qrow + q_lane + (gg * 4 + jj) * 8) = w;
+        }
+      }
+    }
+
+    // ---- next layer's LoRA-down on the 16-bit WMMA, 32 ranks per slab: lora_part[pid_n] = xs @ lora_down[tile]
+    if (e.lora_down) {
+      const int pid_n = c.bn0 / BN;
+      for (int rc = 0; rc < e.R2; rc += 32) {
+        const int rw = e.R2 - rc < 32 ? e.R2 - rc : 32;  // 16 or 32 (R2 % 16 == 0)
+        if (rc > 0) {
+          syncthreads();  // the previous slab's ldT reads are done
+          load_ld(rc);
+        }
+#pragma unroll
+        for (int q = 0; q < LD_PER; q++) {  // write the slab transposed
+          const int ch = c.tid + q * NT, n = ch >> 2, h = ch & 3;
+          if (ch < LD_CH && h * 8 < rw) {
+            const int vv[4] = {ldv[q].x, ldv[q].y, ldv[q].z, ldv[q].w};
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+              ldT[(h * 8 + 2 * k) * XP + n] = (u16)(vv[k] & 0xffff);
+              ldT[(h * 8 + 2 * k + 1) * XP + n] = (u16)((unsigned)vv[k] >> 16);
+            }
+          }
+        }
+        syncthreads();  // xs and ldT visible
+        for (int f = c.wave; f < (BM / 16) * (rw / 16); f += NW) {  // wave-uniform: (16-row slice, 16-rank block)
+          const int mt = f % (BM / 16), rs = f / (BM / 16);
+          v8f d = {};
+          __asm__ volatile("" : "+v"(d));  // see the constant-C WMMA miscompile note in the main loop
+#pragma unroll
+          for (int nc = 0; nc < BN / 16; nc++) {
+            const v4i* pa = (const v4i*)(xs + (mt * 16 + r16) * XP + nc * 16);
+            const v4i* pb = (const v4i*)(ldT + (rs * 16 + r16) * XP + nc * 16);
+            const v4i a0 = pa[0], a1 = pa[1], b0 = pb[0], b1 = pb[1];
+            d = T::wmma(__builtin_bit_cast(typename T::frag, (v8i){a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w}),
+                        __builtin_bit_cast(typename T::frag, (v8i){b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w}), d);
+          }
+          if (c.bm0 + mt * 16 < M) {
+            float* pp = e.lora_part + (long)pid_n * e.stride_lop + (long)(c.bm0 + mt * 16 + hl) * e.stride_lom + rc +
+                        rs * 16 + r16;
+#pragma unroll
+            for (int i = 0; i < 8; i++) pp[(long)(2 * i) * e.stride_lom] = d[i];
+          }
+        }
+      }
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// Instantiations: <name>_<bf16|fp16>_<s|u>_<BM>x<BN>_<WM>x<WN> (s/u = signed/unsigned activations), name = w4a4
+// (plain), w4a4qk (QKNormRopeEpilogue), w4a4gq (GeluQuantEpilogue). The host-side tile tables (w4a4.py: TILES,
+// QK_TILES, GQ_TILES) must list the same tiles.
+
+// (the plain kernel takes no epilogue argument: an empty struct would still occupy a kernel argument slot)
+#define W4A4_KERNEL(NAME, EPI, DT, T, SU, SIGNED, BM, BN, WM, WN)                                                \
+  EXTC __global__ void __launch_bounds__((BM / WM) * (BN / WN) * 32)                                             \
+      NAME##_##DT##_##SU##_##BM##x##BN##_##WM##x##WN(GemmArgs g W4A4_EPI_PARAM_##EPI) {                         \
+    gemm_w4a4<Tile<BM, BN, WM, WN>, SIGNED, T, EPI>(g, W4A4_EPI_ARG_##EPI);                                     \
+  }
+#define W4A4_EPI_PARAM_StoreEpilogue
+#define W4A4_EPI_ARG_StoreEpilogue StoreEpilogue::Args{}
+#define W4A4_EPI_PARAM_QKNormRopeEpilogue , QKNormRopeEpilogue::Args e
+#define W4A4_EPI_ARG_QKNormRopeEpilogue e
+#define W4A4_EPI_PARAM_GeluQuantEpilogue , GeluQuantEpilogue::Args e
+#define W4A4_EPI_ARG_GeluQuantEpilogue e
+#define W4A4_VARIANTS(NAME, EPI, BM, BN, WM, WN)                  \
+  W4A4_KERNEL(NAME, EPI, bf16, BF16, s, true, BM, BN, WM, WN)     \
+  W4A4_KERNEL(NAME, EPI, bf16, BF16, u, false, BM, BN, WM, WN)    \
+  W4A4_KERNEL(NAME, EPI, fp16, FP16, s, true, BM, BN, WM, WN)     \
+  W4A4_KERNEL(NAME, EPI, fp16, FP16, u, false, BM, BN, WM, WN)
 
 // Measured on an RX 7800 XT at FLUX.1 / FLUX.2 [klein] shapes, these two are within ~4% of the best of
 // {64x128, 128x128, 64x256} x {32x32, 32x64, 64x32} everywhere; 64x64 wave tiles spill registers.
-W4A4_TILE(64, 128, 32, 32)
-W4A4_TILE(128, 128, 32, 64)
+W4A4_VARIANTS(w4a4, StoreEpilogue, 64, 128, 32, 32)
+W4A4_VARIANTS(w4a4, StoreEpilogue, 128, 128, 32, 64)
+// Fused epilogues: 128x128 / 32x64 was the fastest of {128x128 32x64, 64x128 32x32, 128x128 64x32} for QK (all
+// FLUX shapes, M = 512 included), and is the GELU epilogue's only fast tile with WN % 64 == 0 that fits in LDS.
+W4A4_VARIANTS(w4a4qk, QKNormRopeEpilogue, 128, 128, 32, 64)
+W4A4_VARIANTS(w4a4gq, GeluQuantEpilogue, 128, 128, 32, 64)
