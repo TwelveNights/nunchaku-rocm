@@ -64,6 +64,16 @@ for native, label in (("0", "triton"), ("", "default")):
     os.environ["NUNCHAKU_NATIVE_GEMM"] = native
     ms=bench(lambda: w4a4.gemm_w4a4(act,wgt,ascales=a,wscales=w,lora_act_in=la,lora_up=lu,qout=qo,oscales=osc,smooth_factor=sm,lora_down=ld,lora_act_out=lao))
     print(f"{'w4a4+geluq M%d N%d K%d (%s)'%(M,N,K,label):<42}{ms:>9.3f}{2*M*N*K/ms/1e9:>11.1f}")
+# SwiGLU-fused MLP input projection (FLUX.2 [klein] 4B single blocks); "triton" = the unfused fallback
+H=9216; N=2*H
+wgt=torch.randint(0,256,(N,K//2),dtype=torch.uint8,device="cuda")
+w=(torch.rand(K//64,N,device="cuda")*.05+.01).to(torch.bfloat16); lu=(torch.randn(N,R,device="cuda")*.02).to(torch.bfloat16)
+qo=torch.empty(M,H//2,dtype=torch.uint8,device="cuda"); osc=torch.empty(H//64,M,dtype=torch.bfloat16,device="cuda")
+sm=(torch.rand(H,device="cuda")+.5).to(torch.bfloat16); ld=(torch.randn(H,R,device="cuda")*.02).to(torch.bfloat16)
+for native, label in (("0", "triton"), ("", "default")):
+    os.environ["NUNCHAKU_NATIVE_GEMM"] = native
+    ms=bench(lambda: w4a4.gemm_w4a4(act,wgt,ascales=a,wscales=w,lora_act_in=la,lora_up=lu,qout=qo,oscales=osc,smooth_factor=sm,lora_down=ld,lora_act_out=lao,fuse_swiglu=True))
+    print(f"{'w4a4+swigluq M%d N%d K%d (%s)'%(M,N,K,label):<42}{ms:>9.3f}{2*M*N*K/ms/1e9:>11.1f}")
 os.environ.pop("NUNCHAKU_NATIVE_GEMM")
 
 # bf16 reference for the same shapes
