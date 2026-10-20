@@ -53,7 +53,7 @@ For reference, dense bf16 `torch.matmul` reaches ~550 TFLOP/s on the same part.
 
 | Model | Setup | Before fusions | After | + native int4 GEMM | + native fused epilogues | Peak VRAM |
 | --- | --- | --- | --- | --- | --- | --- |
-| FLUX.1-schnell | model CPU offload | 17.8 s | 12.2 s | 10.8 s | 8.8 s | 11.2 GiB |
+| FLUX.1-schnell | model CPU offload | 17.8 s | 12.2 s | 10.8 s | 8.8 s | 9.2 GiB (11.2 before fusions) |
 | FLUX.2 [klein] 4B | model CPU offload | 9.6 s | 7.4 s | 6.1 s | 5.8 s | 7.9 GiB |
 | FLUX.2 [klein] 9B | prompt encoded on CPU, transformer + VAE resident | 15.3 s | 9.3 s | 6.5 s | 6.9 s * | 11.3 GiB |
 
@@ -69,6 +69,9 @@ GELU + next-layer-quantize epilogues fused back into the GEMM. FLUX.1
 transformer step: 3.50 → 2.05 s on the 7800 XT, 501 → 301 ms on MI300X.
 Accuracy vs the bf16 model is unchanged (FLUX.1-schnell, 4 prompts: image
 PSNR vs bf16 17.73 → 18.12 dB; Klein 4B per-block correlation unchanged).
+The native gfx11 kernels keep it that way: on the 7800 XT, scored against
+bf16 FLUX.1-schnell outputs recorded on MI300X (same 4 prompts), transformer
+rel-L2 is 0.1690 native vs 0.1692 Triton and image PSNR 18.24 vs 18.28 dB.
 
 The Windows driver does not OOM past 16 GB; it silently spills into shared
 system memory, which is much slower. Keep `torch.cuda.max_memory_allocated()`
