@@ -33,14 +33,11 @@ GPUs (which have no NVIDIA-only mma.m16n8k32-based CUDA extension):
   - ComfyUI custom nodes (comfyui/) that load Nunchaku FLUX.1 and FLUX.2
     checkpoints as ComfyUI models through a thin adapter on ComfyUI's own
     FLUX model code (ComfyUI itself is not included).
+  - Runtime LoRA support (nunchaku/lora/runtime.py) that appends LoRAs to
+    the SVDQuant layers' low-rank branch.
 
-On the `main` branch, no changes were made to the original CUDA kernels,
-C++ extension, or any other part of the upstream project; that branch adds
-the Triton backend as an additional path alongside the existing CUDA one.
-
-On the `triton-only` branch, the CUDA extension and everything that only
-worked through it were removed entirely (this is a real feature loss, not
-a refactor):
+The CUDA extension and everything that only worked through it were removed
+(this is a real feature loss, not a refactor):
 
   - The CUDA build machinery: src/ (kernel sources), nunchaku/csrc/
     (pybind/C++ headers), third_party/ (cutlass, Block-Sparse-Attention,
@@ -57,7 +54,5 @@ a refactor):
     pages, and the CUDA/Windows build guide) and the now-unused Doxygen
     config for the deleted C++ sources.
 
-Only NunchakuFluxTransformer2DModelV2 and the other already-portable models
-(Qwen-Image, Z-Image, SDXL) remain on `triton-only`; SANA, TeaCache, PuLID,
-and IP-Adapter have no equivalent on that branch. See that branch's own
+SANA, TeaCache, PuLID, and IP-Adapter have no equivalent here. See the
 commit history for the itemized list of what was removed and why.

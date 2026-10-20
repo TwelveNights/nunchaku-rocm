@@ -1,29 +1,30 @@
 > ## nunchaku-rocm
 >
-> This is an **AMD ROCm/Triton fork of [Nunchaku](https://github.com/nunchaku-ai/nunchaku)**,
-> not an official Nunchaku release. It adds a portable Triton kernel backend
-> (`nunchaku/ops/triton/`) so quantized models run on AMD GPUs — verified on
-> MI300X (CDNA3) and Radeon PRO W7900 (RDNA3) — without the NVIDIA-only
-> `mma.m16n8k32` CUDA extension. Select it with `NUNCHAKU_BACKEND=triton`.
+> This is an **AMD ROCm/Triton derivative of [Nunchaku](https://github.com/nunchaku-ai/nunchaku)**,
+> not an official Nunchaku release. It replaces Nunchaku's NVIDIA-only CUDA
+> extension with a portable Triton kernel backend (`nunchaku/ops/triton/`) plus
+> hand-written int4 kernels for RDNA3, so 4-bit SVDQuant models run on AMD GPUs
+> — verified on MI300X (CDNA3), Radeon PRO W7900 and RX 7800 XT (RDNA3), on
+> Linux and Windows.
 >
-> **The `triton-only` branch goes further and removes the CUDA extension
-> entirely**, along with everything that only worked through it: the legacy
+> - **Models:** FLUX.1 (`NunchakuFluxTransformer2DModelV2`) and FLUX.2 [klein] 4B / 9B
+>   (`NunchakuFlux2Transformer2DModel`, `examples/v1/flux.2-klein-4b.py`). The Qwen-Image,
+>   Z-Image and SDXL classes remain but their loaders still need Triton layout
+>   conversion (see the Triton README's known gaps).
+> - **LoRA:** `nunchaku.lora.runtime.set_loras` (ComfyUI/BFL, kohya and diffusers formats).
+> - **ComfyUI:** nodes in [`comfyui/`](comfyui/README.md).
+>
+> The CUDA extension and everything that only worked through it (the legacy
 > `NunchakuFluxTransformer2dModel`/SANA model classes, TeaCache, PuLID,
-> IP-Adapter, and their examples/tests/demo apps. Only
-> `NunchakuFluxTransformer2DModelV2` and `NunchakuFlux2Transformer2DModel`
-> (FLUX.2 [klein], `examples/v1/flux.2-klein-4b.py`) are verified on this
-> backend; the Qwen-Image, Z-Image and SDXL classes remain but their loaders
-> still need Triton layout conversion (see the Triton README's known gaps).
-> See **[`NOTICE`](NOTICE)** for the full list of removed features. As a result, **News entries and example links
-> below dated before this fork's `triton-only` branch may point to files that
-> no longer exist here** — they're kept as historical record, not as working
-> links.
+> IP-Adapter, their examples/tests/demo apps) were removed; see
+> **[`NOTICE`](NOTICE)** for the full list. As a result, **News entries and
+> example links below may point to files that no longer exist here** — they're
+> kept as historical record, not as working links.
 >
 > See **[`nunchaku/ops/triton/README.md`](nunchaku/ops/triton/README.md)** for
 > what's implemented, kernel benchmarks, and known gaps, and
-> **[`comfyui/README.md`](comfyui/README.md)** for the ComfyUI nodes (FLUX.1,
-> FLUX.2 [klein] on AMD GPUs). Everything below this point is the original
-> upstream README, otherwise unmodified.
+> **[`comfyui/README.md`](comfyui/README.md)** for the ComfyUI nodes. Everything
+> below this point is the original upstream README, otherwise unmodified.
 
 ______________________________________________________________________
 
