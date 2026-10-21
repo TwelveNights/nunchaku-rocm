@@ -303,6 +303,68 @@ the same composition and text. The packed-QKV attention fast path of the
 fork it was ported from is CUDA-only and not carried over, and the
 `Flux2KleinKVPipeline` reference-KV-cache modes are not supported.
 
+### Qwen-Image, Z-Image and SDXL
+
+`NunchakuQwenImageTransformer2DModel`, `NunchakuZImageTransformer2DModel` and
+`NunchakuSDXLUNet2DConditionModel` convert their checkpoints to the natural
+layout in `from_pretrained` on the Triton backend, like FLUX. Z-Image also
+needed its RoPE in the epilogue's natural `(sin, cos)` layout
+(`transformer_zimage._pack_freqs_cis`) and its own conversion for the QKV
+projection that the loader folds into `NunchakuZImageFusedModule`. Its SwiGLU
+MLPs use the fused SwiGLU + next-layer-quantize GEMM
+(`interleave_swiglu_linear_(..., up_first=True)`, since diffusers' `SwiGLU`
+is `[up | gate]`): bit-identical to the unfused path on Triton, about 0.1 s
+faster per step on the 7800 XT.
+Qwen-Image's AWQ (W4A16) modulation layers run on the Triton AWQ GEMV, and
+its per-block CPU offloading (`set_offload`) works unchanged. Two fixes for
+diffusers 0.41 are not Triton-specific: Qwen-Image's RoPE call
+(`max_txt_seq_len`) and Z-Image's `forward`, which passed `patch_size` /
+`f_patch_size` positionally into what are now `return_dict` /
+`controlnet_block_samples`.
+
+Accuracy, MI300X (Triton kernels), int4 r32 nunchaku-ai checkpoints vs the
+bf16 diffusers model: denoiser output on the bf16 pipeline's own inputs (a
+handful of steps from 2 prompts), and final images (same seeds):
+
+| Model                              | Denoiser rel. L2 (cos) | Image PSNR vs bf16          |
+| ---------------------------------- | ---------------------- | --------------------------- |
+| Z-Image-Turbo, 1024², 8 steps      | 0.293 (0.948)          | 13.5 / 12.6 dB              |
+| Z-Image-Turbo r128                 | 0.281 (0.951)          | 14.2 / 11.4 dB              |
+| SDXL, 1024², 30 steps, CFG 5       | 0.012 (1.000)          | 24.6-24.9 / 17.1-20.6 dB \* |
+| SDXL-Turbo, 512², 4 steps          | 0.069 (0.997)          | 18.7 / 21.0 dB              |
+| Qwen-Image, 1024², 20 steps, CFG 4 | 0.048 (0.999)          | 17.1 / 16.8 dB              |
+| Qwen-Image r128                    | 0.026 (1.000)          | 16.6 / 16.3 dB              |
+
+\* Range over 4 runs: SDXL on MI300X is not bit-reproducible run to run
+(two bf16 runs differ by 33-41 dB PSNR, two int4 runs by 24-28 dB), which
+moves the second prompt's PSNR by a few dB.
+
+Images keep composition and text. SDXL predicts noise, so its relative
+error is small by construction. Z-Image's is large but not a kernel or layout
+error: on real activations the int4 GEMM matches a pure-PyTorch fake-quant
+emulation of the same checkpoint to 0.2-0.35% rel. L2, and even weight-only
+(W4A16) emulation is 8% off bf16 in the late layers (`layers.26` attention
+output at step 1); per-block error grows from ~0.02 in the refiners and
+early layers to 0.14-0.38 in layers 15-29.
+
+End to end on the RX 7800 XT (native gfx11 kernels, steady state, 2 prompts):
+
+| Model                                 | Setup                                               | Time / image | Denoiser step | Peak VRAM |
+| ------------------------------------- | --------------------------------------------------- | ------------ | ------------- | --------- |
+| Z-Image-Turbo r32, 1024², 8 steps     | model CPU offload                                   | 10.8 s       | 0.98 s        | 7.9 GiB   |
+| SDXL r32, 1024², 30 steps, CFG 5      | resident                                            | 11.6 s       | 0.35 s        | 10.1 GiB  |
+| SDXL-Turbo r32, 512², 4 steps         | resident                                            | 0.43 s       | 0.075 s       | 5.7 GiB   |
+| Qwen-Image Lightning r32, 1024², 8 st | `set_offload` (1 block on GPU) + sequential offload | 15.8 s       | 1.36 s        | 9.2 GiB   |
+| Qwen-Image r32, 1024², 20 st, CFG 4   | same                                                | 60.4 s       | 1.37 s        | 9.6 GiB   |
+
+Z-Image fully resident peaks at 17.1 GiB (spills; 20.4 s), and Qwen-Image
+with only the prompt encoded on the CPU and transformer + VAE resident at
+19.8 GiB, so both need offloading on 16 GB. Qwen-Image's per-block offload
+runs at 1.36-1.37 s per step (base and Lightning) in under 10 GiB; there is
+no resident run that fits on this card to compare it with. The 7800 XT images are as close to the MI300X bf16 images as the
+MI300X int4 ones (same prompts and seeds; PSNR Z-Image 13.5 / 12.8 dB, SDXL
+24.7 / 23.9 dB, SDXL-Turbo 20.9 / 21.1 dB, Qwen-Image 17.2 / 18.6 dB).
+
 ### Attention
 
 The model attention processors call `nunchaku.ops.dispatch.scaled_dot_product_attention`,
@@ -385,12 +447,12 @@ each bug:
 
 ## Known gaps
 
-- **Qwen-Image, Z-Image and SDXL loaders don't convert checkpoints to the
-  natural layout.** Only the FLUX.1 and FLUX.2 `from_pretrained` call
-  `convert_svdq_linear_to_natural_layout` on the Triton backend, so the
-  others feed the CUDA mma-fragment layout to kernels that expect row-major
-  weights. Z-Image's RoPE hook also emits the CUDA-only `pack_rotemb`
-  layout. These models are untested on this backend.
+- **Qwen-Image / Z-Image / SDXL: only text-to-image is tested.** The
+  Qwen-Image-Edit pipelines and ControlNet use the same transformer class
+  but were not run; Z-Image's omni mode and batched prompts of different
+  lengths (which add an attention mask) fall back to torch SDPA (slow on
+  Windows ROCm). As upstream, Qwen-Image ignores `encoder_hidden_states_mask`
+  and SDXL rejects attention masks. There are no ComfyUI nodes for them.
 - **Unported `gemm_w4a4` epilogues.** QKV packing (`out_q`/`out_k`/`out_v`,
   only used by the optional `"nunchaku-fp16"` attention processor) and the
   SANA-only linear-attention paths (`poolout`, `out_vk`, `out_linearattn`)
@@ -403,7 +465,7 @@ each bug:
 ## Tests
 
 ```bash
-pytest tests/triton/            # all pass on MI300X (174, gfx11-only cases skipped) and RX 7800 XT (301)
+pytest tests/triton/            # all pass on MI300X (193, gfx11-only cases skipped) and RX 7800 XT (320)
 python tests/triton/bench_kernels.py
 ```
 

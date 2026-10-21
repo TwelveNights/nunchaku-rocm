@@ -3,6 +3,7 @@ This module provides implementations of NunchakuQwenImageTransformer2DModel and 
 """
 
 import gc
+import inspect
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ from diffusers.models.transformers.transformer_qwenimage import (
 from diffusers.utils import logging as diffusers_logging
 from huggingface_hub import utils
 
+from ...ops.backend import get_backend
 from ...utils import get_precision
 from ..attention import NunchakuBaseAttention, NunchakuFeedForward
 from ..attention_processors.qwenimage import NunchakuQwenImageNaiveFA2Processor
@@ -408,6 +410,15 @@ class NunchakuQwenImageTransformer2DModel(QwenImageTransformer2DModel, NunchakuM
         patch_scale_key(transformer, model_state_dict)
 
         transformer.load_state_dict(model_state_dict)
+
+        if get_backend() == "triton":
+            # before set_offload: the offload manager's GPU buffer blocks are copies of the (converted) blocks
+            from ...ops.triton.layout import convert_svdq_linear_to_natural_layout
+
+            for module in transformer.modules():
+                if isinstance(module, SVDQW4A4Linear):
+                    convert_svdq_linear_to_natural_layout(module)
+
         transformer.set_offload(offload)
 
         return transformer
@@ -514,7 +525,13 @@ class NunchakuQwenImageTransformer2DModel(QwenImageTransformer2DModel, NunchakuM
             else self.time_text_embed(timestep, guidance, hidden_states)
         )
 
-        image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
+        if "max_txt_seq_len" in inspect.signature(self.pos_embed.forward).parameters:
+            # newer diffusers: RoPE takes the (padded) text length; the mask is still not applied in attention
+            image_rotary_emb = self.pos_embed(
+                img_shapes, max_txt_seq_len=encoder_hidden_states.shape[1], device=hidden_states.device
+            )
+        else:
+            image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
 
         compute_stream = torch.cuda.current_stream()
         if self.offload:

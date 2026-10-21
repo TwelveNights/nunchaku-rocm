@@ -80,17 +80,23 @@ def fused_gelu_mlp(x: torch.Tensor, fc1: SVDQW4A4Linear, fc2: SVDQW4A4Linear, pa
     return output
 
 
-def interleave_swiglu_linear_(linear: SVDQW4A4Linear) -> None:
+def interleave_swiglu_linear_(linear: SVDQW4A4Linear, up_first: bool = False) -> None:
     """
     Reorder a SwiGLU input projection's output rows in place for :func:`fused_swiglu_mlp`: ``[gate | up]`` becomes
     16-row blocks of gate and up (see ``nunchaku.ops.triton.native.w4a4.interleave_swiglu``), so the native GEMM
     epilogue finds each gate value next to its up value. Triton backend, int4 only, natural layout (after
     ``convert_svdq_linear_to_natural_layout``); call once.
+
+    ``up_first=True`` is for projections whose output is ``[up | gate]`` (diffusers' ``SwiGLU``, which computes
+    ``up * silu(gate)``, e.g. Z-Image) rather than FLUX.2's ``[gate | up]``.
     """
     from .triton.native.w4a4 import interleave_swiglu
 
     assert linear.precision != "nvfp4" and linear.out_features % 64 == 0
     idx = interleave_swiglu(linear.out_features, linear.qweight.device)
+    if up_first:
+        # idx picks rows of a [gate | up] tensor; map them to the same rows of [up | gate]
+        idx = (idx + linear.out_features // 2) % linear.out_features
     with torch.no_grad():
         linear.qweight.data = linear.qweight.data[idx].contiguous()
         linear.wscales.data = linear.wscales.data[:, idx].contiguous()

@@ -7,10 +7,11 @@
 > — verified on MI300X (CDNA3), Radeon PRO W7900 and RX 7800 XT (RDNA3), on
 > Linux and Windows.
 >
-> - **Models:** FLUX.1 (`NunchakuFluxTransformer2DModelV2`) and FLUX.2 [klein] 4B / 9B
->   (`NunchakuFlux2Transformer2DModel`, `examples/v1/flux.2-klein-4b.py`). The Qwen-Image,
->   Z-Image and SDXL classes remain but their loaders still need Triton layout
->   conversion (see the Triton README's known gaps).
+> - **Models:** FLUX.1 (`NunchakuFluxTransformer2DModelV2`), FLUX.2 [klein] 4B / 9B
+>   (`NunchakuFlux2Transformer2DModel`, `examples/v1/flux.2-klein-4b.py`), Qwen-Image
+>   (`NunchakuQwenImageTransformer2DModel`, incl. Lightning and per-block CPU offload),
+>   Z-Image-Turbo (`NunchakuZImageTransformer2DModel`) and SDXL / SDXL-Turbo
+>   (`NunchakuSDXLUNet2DConditionModel`), text-to-image; use the int4 checkpoints.
 > - **LoRA:** `nunchaku.lora.runtime.set_loras` (ComfyUI/BFL, kohya and diffusers formats).
 > - **ComfyUI:** nodes in [`comfyui/`](comfyui/README.md).
 >

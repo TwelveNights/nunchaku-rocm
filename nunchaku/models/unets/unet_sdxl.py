@@ -25,6 +25,7 @@ from torch import nn
 
 from nunchaku.utils import get_precision
 
+from ...ops.backend import get_backend
 from ..attention import NunchakuBaseAttention, _patch_linear
 from ..attention_processors.sdxl import NunchakuSDXLFA2Processor
 from ..linear import SVDQW4A4Linear
@@ -519,6 +520,13 @@ class NunchakuSDXLUNet2DConditionModel(UNet2DConditionModel, NunchakuModelLoader
         converted_state_dict = convert_sdxl_state_dict(model_state_dict)
 
         unet.load_state_dict(converted_state_dict)
+
+        if get_backend() == "triton":
+            from ...ops.triton.layout import convert_svdq_linear_to_natural_layout
+
+            for module in unet.modules():
+                if isinstance(module, SVDQW4A4Linear):
+                    convert_svdq_linear_to_natural_layout(module)
 
         return unet
 

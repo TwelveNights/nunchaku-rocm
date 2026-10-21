@@ -35,6 +35,10 @@ GPUs (which have no NVIDIA-only mma.m16n8k32-based CUDA extension):
     FLUX model code (ComfyUI itself is not included).
   - Runtime LoRA support (nunchaku/lora/runtime.py) that appends LoRAs to
     the SVDQuant layers' low-rank branch.
+  - Triton-backend loading for the Qwen-Image, Z-Image and SDXL models
+    (checkpoint layout conversion, Z-Image's rotary-embedding layout and
+    fused SwiGLU MLP) and fixes for diffusers 0.41's Qwen-Image RoPE and
+    Z-Image forward signatures.
 
 The CUDA extension and everything that only worked through it were removed
 (this is a real feature loss, not a refactor):

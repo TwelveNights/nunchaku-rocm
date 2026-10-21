@@ -9,6 +9,7 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
+from diffusers.models.activations import SwiGLU
 from diffusers.models.attention import FeedForward
 from diffusers.models.attention_processor import Attention
 from diffusers.models.normalization import RMSNorm
@@ -18,6 +19,8 @@ from huggingface_hub import utils
 
 from nunchaku.models.unets.unet_sdxl import NunchakuSDXLFeedForward
 
+from ...ops.backend import get_backend
+from ...ops.fused import fused_swiglu_mlp, interleave_swiglu_linear_
 from ...ops.gemm import svdq_gemm_w4a4_cuda
 from ...ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
 from ...utils import get_precision, pad_tensor
@@ -27,6 +30,28 @@ from ..embeddings import pack_rotemb
 from ..linear import SVDQW4A4Linear
 from ..utils import fuse_linears
 from .utils import NunchakuModelLoaderMixin, convert_fp16, patch_scale_key
+
+
+def _pack_freqs_cis(freqs_cis: torch.Tensor) -> torch.Tensor:
+    """
+    Convert Z-Image's complex ``freqs_cis`` to the layout the fused QKV RMSNorm+RoPE epilogue consumes.
+
+    Parameters
+    ----------
+    freqs_cis : torch.Tensor, shape (B, S, D // 2), complex64
+        ``cos + i sin`` per channel pair, as produced by diffusers' ``RopeEmbedder``.
+
+    Returns
+    -------
+    torch.Tensor
+        Natural layout (B * S, D // 2, 1, 2) float32, last dim (sin, cos), on the Triton backend;
+        the CUDA kernel's packed, 256-padded layout otherwise.
+    """
+    rotemb = torch.view_as_real(freqs_cis).unsqueeze(3)  # (B, S, D // 2, 1, (cos, sin))
+    rotemb = torch.flip(rotemb, dims=[-1])  # (sin, cos)
+    if get_backend() == "triton":
+        return rotemb.reshape(-1, *rotemb.shape[2:]).float().contiguous()
+    return pack_rotemb(pad_tensor(rotemb, 256, 1))
 
 
 class NunchakuZImageRopeHook:
@@ -44,9 +69,7 @@ class NunchakuZImageRopeHook:
         cache_key = freqs_cis.data_ptr()
         packed_freqs_cis = self.packed_cache.get(cache_key, None)
         if packed_freqs_cis is None:
-            packed_freqs_cis = torch.view_as_real(freqs_cis).unsqueeze(3)
-            packed_freqs_cis = torch.flip(packed_freqs_cis, dims=[-1])
-            packed_freqs_cis = pack_rotemb(pad_tensor(packed_freqs_cis, 256, 1))
+            packed_freqs_cis = _pack_freqs_cis(freqs_cis)
             self.packed_cache[cache_key] = packed_freqs_cis
         new_input_kwargs = input_kwargs.copy()
         new_input_kwargs["freqs_cis"] = packed_freqs_cis
@@ -72,11 +95,35 @@ class NunchakuZImageFusedModule(nn.Module):
         for name, param in qkv.named_parameters(prefix="qkv_"):
             setattr(self, name.replace(".", ""), param)
         self.qkv_precision = qkv.precision
+        self.qkv_group_size = qkv.group_size
         self.qkv_out_features = qkv.out_features
         for name, param in norm_q.named_parameters(prefix="norm_q_"):
             setattr(self, name.replace(".", ""), param)
         for name, param in norm_k.named_parameters(prefix="norm_k_"):
             setattr(self, name.replace(".", ""), param)
+
+    def convert_to_natural_layout(self):
+        """
+        Convert the fused QKV projection's parameters from the CUDA checkpoint layout to the natural layout the
+        Triton backend reads (see :func:`~nunchaku.ops.triton.layout.convert_svdq_linear_to_natural_layout`).
+        Call exactly once, after the checkpoint is loaded.
+        """
+        from types import SimpleNamespace
+
+        from ...ops.triton.layout import convert_svdq_linear_to_natural_layout
+
+        convert_svdq_linear_to_natural_layout(
+            SimpleNamespace(
+                qweight=self.qkv_qweight,
+                wscales=self.qkv_wscales,
+                bias=getattr(self, "qkv_bias", None),
+                smooth_factor=self.qkv_smooth_factor,
+                wcscales=getattr(self, "qkv_wcscales", None),
+                proj_down=self.qkv_proj_down,
+                proj_up=self.qkv_proj_up,
+                group_size=self.qkv_group_size,
+            )
+        )
 
     def forward(self, x: torch.Tensor, freqs_cis: Optional[torch.Tensor] = None):
         """
@@ -272,6 +319,14 @@ class NunchakuZImageFeedForward(NunchakuSDXLFeedForward):
         converted_ff = _convert_z_image_ff(ff)
         # forward pass are equivalent to NunchakuSDXLFeedForward
         NunchakuSDXLFeedForward.__init__(self, converted_ff, **kwargs)
+        # set by NunchakuZImageTransformer2DModel.from_pretrained once net[0].proj's rows are interleaved
+        self.swiglu_fused = False
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.swiglu_fused:
+            # SwiGLU + net[2]'s activation quantization fused into net[0].proj's GEMM (Triton backend, int4)
+            return fused_swiglu_mlp(hidden_states, self.net[0].proj, self.net[2])
+        return super().forward(hidden_states)
 
 
 class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLoaderMixin):
@@ -332,24 +387,19 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
             h.remove()
         self.rope_hook_handles.clear()
 
-    def forward(
-        self,
-        x: List[torch.Tensor],
-        t,
-        cap_feats: List[torch.Tensor],
-        patch_size=2,
-        f_patch_size=1,
-        return_dict: bool = True,
-    ):
+    def forward(self, x: List[torch.Tensor], t, cap_feats: List[torch.Tensor], *args, **kwargs):
         """
         Adapted from diffusers.models.transformers.transformer_z_image.ZImageTransformer2DModel#forward
 
         Register pre-forward hooks for caching and substitution of packed `freqs_cis` tensor for all attention submodules and unregister after forwarding is done.
+
+        The remaining arguments are passed through unchanged, since their order differs between diffusers versions
+        (older: ``patch_size, f_patch_size, return_dict``; newer: ``return_dict, controlnet_block_samples, ...``).
         """
         rope_hook = NunchakuZImageRopeHook()
         self.register_rope_hook(rope_hook)
         try:
-            return super().forward(x, t, cap_feats, patch_size, f_patch_size, return_dict)
+            return super().forward(x, t, cap_feats, *args, **kwargs)
         finally:
             self.unregister_rope_hook()
             del rope_hook
@@ -414,5 +464,21 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
             convert_fp16(transformer, model_state_dict)
 
         transformer.load_state_dict(model_state_dict)
+
+        if get_backend() == "triton":
+            from ...ops.triton.layout import convert_svdq_linear_to_natural_layout
+
+            for module in transformer.modules():
+                if isinstance(module, SVDQW4A4Linear):
+                    convert_svdq_linear_to_natural_layout(module)
+                elif isinstance(module, NunchakuZImageFusedModule):
+                    # the to_qkv SVDQW4A4Linear was folded into this module by replace_fused_module
+                    module.convert_to_natural_layout()
+            if precision == "int4":
+                for module in transformer.modules():
+                    if isinstance(module, NunchakuZImageFeedForward) and isinstance(module.net[0], SwiGLU):
+                        # diffusers' SwiGLU computes up * silu(gate) from [up | gate]
+                        interleave_swiglu_linear_(module.net[0].proj, up_first=True)
+                        module.swiglu_fused = True
 
         return transformer
