@@ -30,9 +30,10 @@ GPUs (which have no NVIDIA-only mma.m16n8k32-based CUDA extension):
     instruction that Triton cannot emit, compiled at runtime with hipRTC
     and launched through the HIP runtime via ctypes; the Triton kernel
     remains the fallback and the path on every other GPU.
-  - ComfyUI custom nodes (comfyui/) that load Nunchaku FLUX.1 and FLUX.2
-    checkpoints as ComfyUI models through a thin adapter on ComfyUI's own
-    FLUX model code (ComfyUI itself is not included).
+  - ComfyUI custom nodes (comfyui/) that load Nunchaku FLUX.1, FLUX.2,
+    Qwen-Image, Z-Image and SDXL checkpoints as ComfyUI models through thin
+    adapters on ComfyUI's own model code, including per-block CPU offload for
+    Qwen-Image (ComfyUI itself is not included).
   - Runtime LoRA support (nunchaku/lora/runtime.py) that appends LoRAs to
     the SVDQuant layers' low-rank branch.
   - Triton-backend loading for the Qwen-Image, Z-Image and SDXL models
@@ -60,3 +61,6 @@ The CUDA extension and everything that only worked through it were removed
 
 SANA, TeaCache, PuLID, and IP-Adapter have no equivalent here. See the
 commit history for the itemized list of what was removed and why.
+
+README.md was rewritten for this project; the upstream README is kept
+unmodified (apart from a note at the top) as README_upstream.md.

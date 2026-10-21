@@ -1,10 +1,13 @@
 # Triton kernel backend
 
-A portable reimplementation of Nunchaku's CUDA kernels (`src/kernels/`) in
-Triton. It runs on AMD GPUs as well as NVIDIA — the CUDA kernels depend on
-NVIDIA-only `mma`/`cp.async` PTX and cannot be built for ROCm at all.
+A portable reimplementation of upstream Nunchaku's CUDA kernels
+(`src/kernels/`, not included in this repository) in Triton, plus native int4
+kernels for RDNA3 (below). Upstream's CUDA kernels depend on NVIDIA-only
+`mma`/`cp.async` PTX and cannot be built for ROCm at all.
 
-The CUDA backend remains the default wherever it is available.
+nunchaku-rocm does not ship upstream's compiled extension (`nunchaku._C`), so
+this backend is selected automatically; the `cuda` setting only does anything
+if an upstream-built extension happens to be importable.
 
 ## Selecting a backend
 
@@ -18,8 +21,8 @@ from nunchaku.ops.backend import set_backend, get_backend
 set_backend("triton")
 ```
 
-When `nunchaku._C` is not importable — the normal case on AMD — the backend
-resolves to `triton` automatically.
+When `nunchaku._C` is not importable — always the case with this
+repository — the backend resolves to `triton` automatically.
 
 ## What is ported
 
@@ -288,10 +291,10 @@ coordinates and the LDS buffer), so fused epilogues are added as new
 
 ## Status: working end to end
 
-`NunchakuFluxTransformer2DModelV2` (FLUX.1-schnell, real checkpoint) now
-generates coherent images on the MI300X via the Triton backend, verified with
-`examples/v1/flux.1-schnell-triton.py`. All 145 kernel-level tests in
-`tests/triton/` pass.
+`NunchakuFluxTransformer2DModelV2` (FLUX.1-schnell, real checkpoint)
+generates coherent images on the Triton backend, verified with
+`examples/v1/flux.1-schnell-triton.py` (see [Tests](#tests) for the test
+suite).
 
 `NunchakuFlux2Transformer2DModel` (FLUX.2 [klein], `transformer_flux2.py`)
 runs the community `tonera/FLUX.2-klein-*-Nunchaku` checkpoints; see
@@ -361,8 +364,8 @@ Z-Image fully resident peaks at 17.1 GiB (spills; 20.4 s), and Qwen-Image
 with only the prompt encoded on the CPU and transformer + VAE resident at
 19.8 GiB, so both need offloading on 16 GB. Qwen-Image's per-block offload
 runs at 1.36-1.37 s per step (base and Lightning) in under 10 GiB; there is
-no resident run that fits on this card to compare it with. The 7800 XT images are as close to the MI300X bf16 images as the
-MI300X int4 ones (same prompts and seeds; PSNR Z-Image 13.5 / 12.8 dB, SDXL
+no resident run that fits on this card to compare it with. The 7800 XT
+images are as close to the MI300X bf16 images as the MI300X int4 ones (same prompts and seeds; PSNR Z-Image 13.5 / 12.8 dB, SDXL
 24.7 / 23.9 dB, SDXL-Turbo 20.9 / 21.1 dB, Qwen-Image 17.2 / 18.6 dB).
 
 ### Attention
@@ -452,20 +455,19 @@ each bug:
   but were not run; Z-Image's omni mode and batched prompts of different
   lengths (which add an attention mask) fall back to torch SDPA (slow on
   Windows ROCm). As upstream, Qwen-Image ignores `encoder_hidden_states_mask`
-  and SDXL rejects attention masks. There are no ComfyUI nodes for them.
+  and SDXL rejects attention masks. The ComfyUI nodes (`comfyui/`) cover
+  the same text-to-image paths.
 - **Unported `gemm_w4a4` epilogues.** QKV packing (`out_q`/`out_k`/`out_v`,
   only used by the optional `"nunchaku-fp16"` attention processor) and the
   SANA-only linear-attention paths (`poolout`, `out_vk`, `out_linearattn`)
   are not implemented; `nunchaku/ops/gemm.py` raises `NotImplementedError`
   when they are requested.
-- **Model-level integration for SANA.** `nunchaku/models/transformers/transformer_sana.py`
-  delegates its entire forward pass to the compiled C++ `QuantizedSanaModel`
-  and is out of scope for this backend.
 
 ## Tests
 
 ```bash
 pytest tests/triton/            # all pass on MI300X (193, gfx11-only cases skipped) and RX 7800 XT (320)
+COMFYUI_PATH=/path/to/ComfyUI pytest tests/comfyui   # ComfyUI adapters (skipped without COMFYUI_PATH)
 python tests/triton/bench_kernels.py
 ```
 
@@ -476,7 +478,8 @@ hipRTC compile/cache/launch machinery (any AMD GPU).
 Kernel-level tests compare against fp32 torch references computed from the
 same packed tensors the kernels read. `test_layout.py` additionally validates
 checkpoint-layout conversions against `NunchakuWeightPacker` round-trips.
-Neither test suite currently includes a full-model / real-checkpoint
-end-to-end check — that comparison was done manually against a
-`diffusers`-loaded full-precision reference model (see "Status" above) and
-would be a good candidate for a proper regression test.
+Neither test suite includes a full-model / real-checkpoint end-to-end check
+-- those comparisons need the checkpoints and are scripts instead: the
+block-by-block and image comparisons against `diffusers` bf16 models above,
+and `comfyui/scripts/check_against_bf16.py` / `run_workflows.py` for the
+ComfyUI nodes.
