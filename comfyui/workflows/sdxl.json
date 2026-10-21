@@ -1,0 +1,141 @@
+{
+  "1": {
+    "class_type": "NunchakuRocmDiTLoader",
+    "inputs": {
+      "model_name": "svdq-int4_r32-sdxl.safetensors"
+    },
+    "_meta": {
+      "title": "Nunchaku DiT Loader (ROCm)"
+    }
+  },
+  "2": {
+    "class_type": "DualCLIPLoader",
+    "inputs": {
+      "clip_name1": "clip_l.safetensors",
+      "clip_name2": "clip_g.safetensors",
+      "type": "sdxl"
+    },
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "3": {
+    "class_type": "CLIPTextEncodeSDXL",
+    "inputs": {
+      "clip": [
+        "2",
+        0
+      ],
+      "width": 1024,
+      "height": 1024,
+      "crop_w": 0,
+      "crop_h": 0,
+      "target_width": 1024,
+      "target_height": 1024,
+      "text_g": "A cat holding a sign that says hello world, photo",
+      "text_l": "A cat holding a sign that says hello world, photo"
+    },
+    "_meta": {
+      "title": "Prompt"
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncodeSDXL",
+    "inputs": {
+      "clip": [
+        "2",
+        0
+      ],
+      "width": 1024,
+      "height": 1024,
+      "crop_w": 0,
+      "crop_h": 0,
+      "target_width": 1024,
+      "target_height": 1024,
+      "text_g": "",
+      "text_l": ""
+    },
+    "_meta": {
+      "title": "Negative"
+    }
+  },
+  "5": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "sdxl_vae.safetensors"
+    },
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "6": {
+    "class_type": "EmptyLatentImage",
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    },
+    "_meta": {
+      "title": "Empty Latent"
+    }
+  },
+  "7": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "seed": 0,
+      "steps": 30,
+      "cfg": 5.0,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "positive": [
+        "3",
+        0
+      ],
+      "negative": [
+        "4",
+        0
+      ],
+      "latent_image": [
+        "6",
+        0
+      ],
+      "denoise": 1.0
+    },
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "8": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "7",
+        0
+      ],
+      "vae": [
+        "5",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "9": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "8",
+        0
+      ],
+      "filename_prefix": "nunchaku-sdxl"
+    },
+    "_meta": {
+      "title": "Save Image"
+    }
+  }
+}
