@@ -219,7 +219,8 @@ def get_precision(
             device = torch.device(device)
         capability = torch.cuda.get_device_capability(0 if device.index is None else device.index)
         sm = f"{capability[0]}{capability[1]}"
-        precision = "fp4" if sm in ["120", "121"] else "int4"
+        # On ROCm the capability is the gfx version (gfx1201 -> 12.1); AMD GPUs run int4 natively and fp4 only emulated.
+        precision = "fp4" if sm in ["120", "121"] and torch.version.hip is None else "int4"
     if pretrained_model_name_or_path is not None:
         if precision == "int4":
             if "fp4" in str(pretrained_model_name_or_path):
@@ -303,6 +304,8 @@ def check_hardware_compatibility(quantization_config: dict, device: str | torch.
     """
     if isinstance(device, str):
         device = torch.device(device)
+    if torch.version.hip is not None:
+        return  # the Triton backend runs int4 and (emulated) fp4 checkpoints on any ROCm GPU
     capability = torch.cuda.get_device_capability(0 if device.index is None else device.index)
     sm = f"{capability[0]}{capability[1]}"
     if sm in ["120", "121"]:  # you can only use the fp4 models
