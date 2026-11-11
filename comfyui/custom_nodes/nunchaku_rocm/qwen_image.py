@@ -191,8 +191,11 @@ class NunchakuQwenImageAdapter(LoraMixin, QwenImageTransformer2DModel):
     ):
         if control is not None:
             raise NotImplementedError("Nunchaku Qwen-Image models do not support ControlNet in ComfyUI yet")
-        if ref_latents is not None:
-            raise NotImplementedError("reference latents (Qwen-Image-Edit) are not supported by Nunchaku models yet")
+        ref_method = kwargs.get("ref_latents_method", self.default_ref_method)
+        if ref_latents is not None and ref_method == "index_timestep_zero":
+            raise NotImplementedError(
+                "reference_latents_method 'index_timestep_zero' (per-token timesteps) is not supported by Nunchaku models"
+            )
         if additional_t_cond is not None:
             raise NotImplementedError("additional timestep conditioning is not supported by this Nunchaku model")
         if transformer_options.get("patches") or transformer_options.get("patches_replace", {}).get("dit"):
@@ -211,6 +214,26 @@ class NunchakuQwenImageAdapter(LoraMixin, QwenImageTransformer2DModel):
 
         hidden_states, img_ids, orig_shape = self.process_img(x)
         num_embeds = hidden_states.shape[1]
+        if ref_latents is not None:
+            # Qwen-Image-Edit: reference images join the image tokens, placed as in ComfyUI's _forward
+            h = w = index = 0
+            for ref in ref_latents:
+                h_offset = w_offset = 0
+                if ref_method == "index":
+                    index += 1
+                elif ref_method == "negative_index":
+                    index -= 1
+                else:
+                    index = 1
+                    if ref.shape[-2] + h > ref.shape[-1] + w:
+                        w_offset = w
+                    else:
+                        h_offset = h
+                    h = max(h, ref.shape[-2] + h_offset)
+                    w = max(w, ref.shape[-1] + w_offset)
+                ref_tokens, ref_ids, _ = self.process_img(ref, index=index, h_offset=h_offset, w_offset=w_offset)
+                hidden_states = torch.cat([hidden_states, ref_tokens], dim=1)
+                img_ids = torch.cat([img_ids, ref_ids], dim=1)
         txt_start = round(
             max(
                 ((x.shape[-1] + (self.patch_size // 2)) // self.patch_size) // 2,

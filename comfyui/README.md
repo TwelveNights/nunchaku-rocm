@@ -28,8 +28,9 @@ Category *Nunchaku (ROCm)*:
 | FLUX.2 [klein] 4B                       | `tonera/FLUX.2-klein-4B-Nunchaku`: `svdq-int4_r32-…`                          | `qwen_3_4b.safetensors` (type `flux2`)                      | `flux2-vae.safetensors`      | verified (text-to-image, reference editing) |
 | FLUX.2 [klein] 9B                       | `tonera/FLUX.2-klein-9B-Nunchaku`: `svdq-int4_r32-…`                          | `qwen_3_8b_fp8mixed.safetensors` (type `flux2`)             | `flux2-vae.safetensors`      | verified                                    |
 | FLUX.1-schnell                          | `nunchaku-ai/nunchaku-flux.1-schnell`: `svdq-int4_r32-…`                      | `clip_l` + `t5xxl_fp16` (DualCLIPLoader, type `flux`)       | `ae.safetensors`             | verified                                    |
-| FLUX.1-dev / Krea / Kontext, fine-tunes | Nunchaku FLUX.1 `svdq-int4_*`                                                 | `clip_l` + `t5xxl_fp16`                                     | `ae.safetensors`             | same code path, not tested                  |
+| FLUX.1-dev / Krea / Kontext, fine-tunes | Nunchaku FLUX.1 `svdq-int4_*`                                                 | `clip_l` + `t5xxl_fp16`                                     | `ae.safetensors`             | same code path (verified in diffusers)      |
 | Qwen-Image, Qwen-Image Lightning        | `nunchaku-ai/nunchaku-qwen-image`: `svdq-int4_r32-qwen-image…`                | `qwen_2.5_vl_7b_fp8_scaled.safetensors` (type `qwen_image`) | `qwen_image_vae.safetensors` | verified (text-to-image)                    |
+| Qwen-Image-Edit, -2509                  | `nunchaku-ai/nunchaku-qwen-image-edit` (`-2509`): `svdq-int4_r32-…`           | `qwen_2.5_vl_7b_fp8_scaled.safetensors` (type `qwen_image`) | `qwen_image_vae.safetensors` | verified (2509, TextEncodeQwenImageEditPlus) |
 | Z-Image-Turbo                           | `nunchaku-ai/nunchaku-z-image-turbo`: `svdq-int4_r32-z-image-turbo` (or r128) | `qwen_3_4b.safetensors` (type `lumina2`)                    | `ae.safetensors`             | verified                                    |
 | SDXL, SDXL-Turbo                        | `nunchaku-ai/nunchaku-sdxl`, `nunchaku-ai/nunchaku-sdxl-turbo`                | `clip_l` + `clip_g` (DualCLIPLoader, type `sdxl`)           | `sdxl_vae.safetensors`       | verified (text-to-image)                    |
 
@@ -48,9 +49,9 @@ Where the encoder and VAE files come from:
 
 Use INT4 checkpoints: no AMD GPU has FP4 matrix units, so NVFP4 files run on an emulated path.
 
-Not supported yet: ControlNet, Qwen-Image-Edit / reference latents for Qwen-Image and Z-Image's omni inputs (the
-nodes raise an error), model-patching nodes that replace transformer blocks or
-attention (they are ignored with a warning), FLUX.2's `index_timestep_zero` reference method.
+Not supported yet: ControlNet, Z-Image's omni inputs (the nodes raise an error), model-patching nodes that replace
+transformer blocks or attention (they are ignored with a warning), the `index_timestep_zero` reference method
+(FLUX.2, Qwen-Image-Edit-2511).
 
 ## Install
 

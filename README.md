@@ -13,7 +13,10 @@ AMD hardware at all. nunchaku-rocm replaces that extension with
 - **hand-written int4 kernels for RDNA3** (`nunchaku/ops/triton/native/`): Triton cannot emit RDNA3's int4 matrix
   instruction (`v_wmma_i32_16x16x16_iu4`), so the GEMMs run on a HIP kernel compiled at runtime with hipRTC (no
   compiler toolchain needed, also on Windows), 2.2x faster than the Triton kernel on an RX 7800 XT;
-- **ComfyUI nodes** ([`comfyui/`](comfyui/README.md)) and **runtime LoRA** for FLUX (`nunchaku.lora.runtime`).
+- **ComfyUI nodes** ([`comfyui/`](comfyui/README.md)) and **runtime LoRA** for FLUX, Qwen-Image, Z-Image and SDXL
+  (`nunchaku.lora.runtime`);
+- a drop-in for **Diffusers' native "Nunchaku Lite" checkpoints** (`nunchaku.diffusers_lite`), whose kernels are
+  otherwise CUDA-only -- e.g. the LTX-2.3 video model below.
 
 The diffusers-style model classes and the Python API are upstream's (`from nunchaku import ...`), so upstream's
 model docs and examples largely apply.
@@ -35,21 +38,32 @@ upstream Nunchaku.
 
 ## Supported models
 
-All text-to-image, with the INT4 checkpoints (no AMD GPU has FP4 matrix units; NVFP4 checkpoints load but run an
-emulated path):
+With the INT4 checkpoints (no AMD GPU has FP4 matrix units; NVFP4 checkpoints load but run an emulated path):
 
 | Model                       | Class                                                              | INT4 checkpoints                                               | diffusers                  | ComfyUI                        |
 | --------------------------- | ------------------------------------------------------------------ | -------------------------------------------------------------- | -------------------------- | ------------------------------ |
 | FLUX.1-schnell              | `NunchakuFluxTransformer2DModelV2`                                 | `nunchaku-ai/nunchaku-flux.1-schnell`                          | yes                        | yes                            |
-| FLUX.1-dev / Krea / Kontext | same                                                               | `nunchaku-ai/nunchaku-flux.1-*`                                | same code path, not tested | same                           |
+| FLUX.1-dev / Krea / Kontext | same                                                               | `nunchaku-ai/nunchaku-flux.1-*`                                | yes                        | same code path                 |
 | FLUX.2 [klein] 4B / 9B      | `NunchakuFlux2Transformer2DModel`                                  | `tonera/FLUX.2-klein-4B-Nunchaku`, `...-9B-Nunchaku`           | yes, + LoRA                | yes, + LoRA, reference editing |
 | Qwen-Image (+ Lightning)    | `NunchakuQwenImageTransformer2DModel`                              | `nunchaku-ai/nunchaku-qwen-image`                              | yes, per-block CPU offload | yes, per-block CPU offload     |
+| Qwen-Image-Edit / -2509     | same                                                               | `nunchaku-ai/nunchaku-qwen-image-edit`, `...-edit-2509`        | yes                        | yes, reference images          |
 | Z-Image-Turbo               | `NunchakuZImageTransformer2DModel`                                 | `nunchaku-ai/nunchaku-z-image-turbo`                           | yes                        | yes                            |
 | SDXL, SDXL-Turbo            | `nunchaku.models.unets.unet_sdxl.NunchakuSDXLUNet2DConditionModel` | `nunchaku-ai/nunchaku-sdxl`, `nunchaku-ai/nunchaku-sdxl-turbo` | yes                        | yes                            |
 
-Not supported: Qwen-Image-Edit and other image-conditioned variants (untested; reference latents are rejected in
-ComfyUI), ControlNet, LoRA on the non-FLUX models, and everything upstream ran only through its CUDA extension
-(SANA, TeaCache, PuLID, IP-Adapter, the 4-bit T5 encoder -- see [`NOTICE`](NOTICE)).
+Diffusers "Nunchaku Lite" checkpoints (`quant_method: nunchaku_lite`, loaded by Diffusers' own quantizer) run through
+`nunchaku.diffusers_lite`; validated with `lite-infer/LTX-2.3-Distilled-v1.1-Diffusers-nunchaku-lite-int4` (text to
+video with audio):
+
+```python
+import nunchaku.diffusers_lite
+
+nunchaku.diffusers_lite.enable()  # before loading; answers Diffusers' CUDA kernel request with the Triton kernels
+pipe = LTX2Pipeline.from_pretrained("lite-infer/LTX-2.3-Distilled-v1.1-Diffusers-nunchaku-lite-int4", torch_dtype=torch.bfloat16)
+```
+
+Not supported: Qwen-Image-Edit-2511's `index_timestep_zero` reference method, FLUX.1 Fill / Canny / Depth (untested),
+ControlNet, and everything upstream ran only through its CUDA extension (SANA, TeaCache, PuLID, IP-Adapter, the 4-bit
+T5 encoder -- see [`NOTICE`](NOTICE)).
 
 ## Install
 
@@ -177,6 +191,10 @@ ComfyUI's own bf16 models):
 | Qwen-Image (20 steps, CFG)  | 17.1 / 16.8 dB          | 21.9 dB                       |
 | SDXL (20-30 steps, CFG 5)   | 24.6 / 17.1-20.6 dB     | 23.9 dB                       |
 | SDXL-Turbo (4 steps)        | 18.7 / 21.0 dB          | 14.6 / 16.7 dB \*             |
+| FLUX.1-dev (28 steps)       | 26.9 dB                 |                               |
+| FLUX.1 Krea (20 steps)      | 18.9 dB                 |                               |
+| FLUX.1 Kontext (20 steps)   | 17.5 dB                 |                               |
+| Qwen-Image-Edit-2509 (20)   |                         | 15.3 dB                       |
 
 \* The ComfyUI SDXL-Turbo workflow (ancestral sampler, which amplifies differences); the other ComfyUI numbers are
 from `comfyui/scripts/check_against_bf16.py`. The RX 7800 XT's ComfyUI images are as close to the MI300X bf16 images
@@ -197,7 +215,9 @@ RX 7800 XT, 193 passed on MI300X with the gfx11-only cases skipped) and `COMFYUI
 - **Windows VRAM:** the driver does not report out-of-memory past 16 GB; it silently spills into shared system memory,
   which is several times slower. Keep peak usage under the card's VRAM (the setups above do).
 - **First run** of each model and resolution compiles and autotunes kernels (tens of seconds to a minute; cached
-  afterwards).
+  afterwards). The video-style VAEs (Qwen-Image's, LTX's) use 3-D convolutions that MIOpen tunes exhaustively on
+  first use, which can take many minutes in diffusers; `MIOPEN_FIND_MODE=FAST` avoids that (ComfyUI sidesteps it by
+  not using MIOpen for convolutions).
 - Only the model paths listed above are tested. Attention masks (e.g. batched prompts of different lengths) fall back
   to PyTorch SDPA, which is slow on Windows ROCm; Qwen-Image ignores its text mask, as upstream does.
 - Removed with the CUDA extension: SANA, TeaCache, PuLID, IP-Adapter, the 4-bit T5 encoder, upstream's wheels and
