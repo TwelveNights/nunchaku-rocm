@@ -18,8 +18,8 @@ Category *Nunchaku (ROCm)*:
     through the GPU one at a time (overlapped with compute). `auto` turns it on for GPUs with less than 20 GiB.
   - `num_blocks_on_gpu` (default 1): blocks that stay resident with offload on. More blocks use more VRAM and less
     PCIe traffic.
-- **Nunchaku LoRA Loader (ROCm)** (`NunchakuRocmLoraLoader`) adds a LoRA to a FLUX.1 / FLUX.2 [klein] model from the
-  loader (chain several for multiple LoRAs). See [LoRA](#lora).
+- **Nunchaku LoRA Loader (ROCm)** (`NunchakuRocmLoraLoader`) adds a LoRA to a model from the loader
+  (chain several for multiple LoRAs). See [LoRA](#lora).
 
 ## Supported models
 
@@ -49,7 +49,7 @@ Where the encoder and VAE files come from:
 Use INT4 checkpoints: no AMD GPU has FP4 matrix units, so NVFP4 files run on an emulated path.
 
 Not supported yet: ControlNet, Qwen-Image-Edit / reference latents for Qwen-Image and Z-Image's omni inputs (the
-nodes raise an error), LoRA for Qwen-Image / Z-Image / SDXL, model-patching nodes that replace transformer blocks or
+nodes raise an error), model-patching nodes that replace transformer blocks or
 attention (they are ignored with a warning), FLUX.2's `index_timestep_zero` reference method.
 
 ## Install
@@ -148,8 +148,9 @@ memory and everything gets several times slower. Measured peaks below stay under
 
 Use **Nunchaku LoRA Loader (ROCm)** -- ComfyUI's own LoraLoader patches full-precision weights by name and cannot reach
 the 4-bit layers. FLUX.1 and FLUX.2 [klein] LoRAs in ComfyUI / BFL (`diffusion_model.double_blocks...`), kohya
-(`lora_unet_...`) and diffusers / PEFT (`transformer.transformer_blocks...`) format all work; text-encoder weights in a
-LoRA file are ignored. The loader is implemented by `nunchaku.lora.runtime.set_loras` (usable from Python too): on the
+(`lora_unet_...`) and diffusers / PEFT (`transformer.transformer_blocks...`) format all work, and so do Z-Image,
+Qwen-Image (also with `cpu_offload`) and SDXL LoRAs in ComfyUI, diffusers or kohya format, including SDXL convolution
+(LoCon) LoRAs such as LCM-LoRA; text-encoder weights in a LoRA file are ignored. The loader is implemented by `nunchaku.lora.runtime.set_loras` (usable from Python too): on the
 4-bit SVDQuant layers the LoRA is appended to the layer's existing 16-bit low-rank branch (no extra kernels; ~0.3 s
 per Klein 4B image on the RX 7800 XT), other layers get a small hook. Switching LoRAs or strengths between runs
 re-applies them in a fraction of a second; MODEL branches with and without LoRAs can share one loaded model.
@@ -163,6 +164,19 @@ Checked against ComfyUI's own LoRA loading on its bf16 model (`scripts/check_lor
 | alvdansen softserve_anime (diffusers, r64) | FLUX.1-schnell | 15.0 dB                            | 7.3 dB                    |
 
 In every case the LoRA's effect (style / subject change) is reproduced; the per-image gap is the usual 4-bit one.
+
+Z-Image, Qwen-Image and SDXL, against ComfyUI's LoRA loading on the bf16 models (Radeon PRO W7900, ComfyUI 0.45, same
+seed and sampler):
+
+| LoRA (format)                                         | Model                     | Image PSNR, ours+LoRA vs bf16+LoRA | bf16+LoRA vs bf16 without |
+| ----------------------------------------------------- | ------------------------- | ---------------------------------- | ------------------------- |
+| renderartist Coloring-Book (ComfyUI, r32)             | Z-Image-Turbo, 8 steps    | 14.2 dB                            | 13.5 dB                   |
+| ostris watercolor (kohya, attention)                  | SDXL, 20 steps            | 18.9 dB                            | 13.0 dB                   |
+| latent-consistency LCM-LoRA (kohya, incl. conv)       | SDXL, 4 steps LCM         | 22.4 dB                            | 15.7 dB                   |
+| lightx2v Qwen-Image-Lightning 8-step V1.1 (diffusers) | Qwen-Image, 8 steps cfg 1 | 18.4 dB (same with `cpu_offload`)  | 17.7 dB                   |
+
+The 4-bit model's activations are quantized too, so a LoRA's effect on it is close to, not identical with, its effect
+on the bf16 model; per layer the added LoRA term is exact.
 
 ## Performance (RX 7800 XT, 16 GB, Windows 11, ROCm 7.2.1)
 

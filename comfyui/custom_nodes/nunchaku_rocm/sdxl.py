@@ -16,6 +16,8 @@ import torch
 from comfy.ldm.modules.diffusionmodules.openaimodel import UNetModel
 from torch import nn
 
+from .lora import LoraMixin
+
 logger = logging.getLogger(__name__)
 
 
@@ -24,7 +26,7 @@ def _aug_embed_from_y(self, emb, encoder_hidden_states, added_cond_kwargs):
     return self.add_embedding(added_cond_kwargs["comfy_y"].to(emb.dtype))
 
 
-class NunchakuSDXLAdapter(UNetModel):
+class NunchakuSDXLAdapter(LoraMixin, UNetModel):
     """
     ComfyUI ``diffusion_model`` wrapping a Nunchaku SDXL UNet.
 
@@ -43,6 +45,10 @@ class NunchakuSDXLAdapter(UNetModel):
         unet.get_aug_embed = types.MethodType(_aug_embed_from_y, unet)
         self.unet = unet
         self._warned = set()
+        self._init_loras()
+
+    def _lora_model(self) -> nn.Module:
+        return self.unet
 
     def _warn_once(self, key: str, msg: str) -> None:
         if key not in self._warned:
@@ -58,6 +64,7 @@ class NunchakuSDXLAdapter(UNetModel):
             self._warn_once(
                 "patches", "Nunchaku: UNet patches (e.g. from model-patching nodes) are ignored by this model"
             )
+        self._sync_loras(transformer_options)
         return self.unet(
             x.to(self.dtype),
             timesteps,

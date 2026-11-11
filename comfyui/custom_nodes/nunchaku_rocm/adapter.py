@@ -17,12 +17,14 @@ import torch
 from comfy.ldm.flux.model import Flux, FluxParams
 from torch import nn
 
+from .lora import LoraMixin
+
 logger = logging.getLogger(__name__)
 
 _PARAM_FIELDS = set(FluxParams.__dataclass_fields__)
 
 
-class NunchakuFluxAdapter(Flux):
+class NunchakuFluxAdapter(LoraMixin, Flux):
     """
     ComfyUI ``diffusion_model`` wrapping a Nunchaku FLUX.1 or FLUX.2 transformer.
 
@@ -50,27 +52,7 @@ class NunchakuFluxAdapter(Flux):
         self.is_flux2 = unet_config["image_model"] == "flux2"
         self.transformer = transformer
         self._warned = set()
-        # LoRAs are requested per sampling call through transformer_options (see nodes.NunchakuLoraLoader), so
-        # MODEL branches with and without LoRAs share this transformer; applied lazily when the request changes
-        self._applied_loras: tuple = ()
-        self._lora_cache: dict[str, dict] = {}
-
-    def _apply_loras(self, requested: tuple) -> None:
-        import comfy.utils
-
-        from nunchaku.lora.runtime import load_lora, lora_model_info, set_loras
-
-        info = lora_model_info(self.transformer)
-        loras = []
-        for path, strength in requested:
-            if path not in self._lora_cache:
-                self._lora_cache[path] = load_lora(comfy.utils.load_torch_file(path, safe_load=True), info)
-            loras.append((self._lora_cache[path], strength))
-        set_loras(self.transformer, loras)
-        self._applied_loras = requested
-        # drop cached LoRAs no longer requested
-        keep = {p for p, _ in requested}
-        self._lora_cache = {p: w for p, w in self._lora_cache.items() if p in keep}
+        self._init_loras()
 
     def _warn_once(self, key: str, msg: str) -> None:
         if key not in self._warned:
@@ -104,9 +86,7 @@ class NunchakuFluxAdapter(Flux):
                 "patches", "Nunchaku: transformer patches (e.g. from model-patching nodes) are ignored by this model"
             )
 
-        requested = tuple(transformer_options.get("nunchaku_loras", ()))
-        if requested != self._applied_loras:
-            self._apply_loras(requested)
+        self._sync_loras(transformer_options)
 
         kwargs = dict(
             hidden_states=img,

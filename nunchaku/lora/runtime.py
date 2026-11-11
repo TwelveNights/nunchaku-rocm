@@ -1,5 +1,5 @@
 """
-Apply LoRAs to a loaded Nunchaku FLUX.1 / FLUX.2 transformer at runtime.
+Apply LoRAs to a loaded Nunchaku FLUX.1 / FLUX.2 / Z-Image / Qwen-Image transformer or SDXL UNet at runtime.
 
 :func:`set_loras` attaches any number of LoRAs (with strengths) to a
 :class:`~nunchaku.models.transformers.transformer_flux_v2.NunchakuFluxTransformer2DModelV2` or
@@ -18,6 +18,11 @@ img_attn.qkv.lora_A.weight``), kohya (``lora_unet_double_blocks_0_img_attn_qkv.l
 ``.alpha``), and diffusers / PEFT (``transformer.transformer_blocks.0.attn.to_q.lora_A.weight``). Everything
 is first normalized to BFL module names, then mapped onto this repo's (diffusers-derived, fused) layers.
 Text-encoder LoRA weights are ignored.
+
+Z-Image, Qwen-Image and SDXL LoRAs (ComfyUI ``diffusion_model.`` / diffusers ``transformer.`` / ``unet.`` keys, or
+kohya ``lora_unet_`` keys) are matched to the model's own (diffusers) module names; separate q / k / v LoRAs are
+fused for the fused qkv projections, Z-Image's ``w1`` / ``w3`` into its SwiGLU projection. SDXL convolution LoRAs
+(LoCon) are applied with a forward hook.
 """
 
 import logging
@@ -40,6 +45,7 @@ class LoraWeight:
     down: torch.Tensor
     up: torch.Tensor
     scale: float = 1.0
+    kernel: tuple = ()  # conv LoRA: down's kernel size (down is stored flattened)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -75,6 +81,8 @@ def _split_pairs(sd: dict[str, torch.Tensor]) -> tuple[str, dict[str, LoraWeight
             (".lora_B.weight", "up"),
             (".lora_down.weight", "down"),
             (".lora_up.weight", "up"),
+            (".lora.down.weight", "down"),
+            (".lora.up.weight", "up"),
             (".alpha", "alpha"),
         ):
             if key.endswith(suffix):
@@ -86,7 +94,7 @@ def _split_pairs(sd: dict[str, torch.Tensor]) -> tuple[str, dict[str, LoraWeight
             continue
         down, up = g["down"].float().flatten(1), g["up"].float().flatten(1)
         scale = float(g["alpha"]) / down.shape[0] if "alpha" in g else 1.0
-        out[module] = LoraWeight(down, up, scale)
+        out[module] = LoraWeight(down, up, scale, tuple(g["down"].shape[2:]))
     names = list(out)
     if any(n.startswith("lora_unet_") for n in names):
         scheme = "kohya"
@@ -189,6 +197,8 @@ def load_lora(lora: str | PathLike | dict[str, torch.Tensor], dims: dict) -> dic
     scheme, pairs = _split_pairs(lora)
     if not pairs:
         raise ValueError("no LoRA weights found (expected lora_A/lora_B or lora_down/lora_up keys)")
+    if dims.get("kind") not in ("flux1", "flux2"):
+        return pairs  # mapped onto the model by _native_targets
     if scheme == "kohya":
         out, skipped = {}, 0
         for name, w in pairs.items():
@@ -234,6 +244,17 @@ def lora_model_info(model: nn.Module) -> dict:
     if isinstance(model, NunchakuFluxTransformer2DModelV2):
         blk = model.single_transformer_blocks[0]
         return dict(kind="flux1", inner=blk.attn.inner_dim, mlp_in_out=blk.mlp_hidden_dim)
+    from ..models.transformers.transformer_qwenimage import NunchakuQwenImageTransformer2DModel
+    from ..models.transformers.transformer_zimage import NunchakuZImageTransformer2DModel
+    from ..models.unets.unet_sdxl import NunchakuSDXLUNet2DConditionModel
+
+    for cls, kind in (
+        (NunchakuZImageTransformer2DModel, "zimage"),
+        (NunchakuQwenImageTransformer2DModel, "qwenimage"),
+        (NunchakuSDXLUNet2DConditionModel, "sdxl"),
+    ):
+        if isinstance(model, cls):
+            return dict(kind=kind, modules={name: m for name, m in model.named_modules()})
     raise TypeError(f"LoRA: unsupported model {type(model).__name__}")
 
 
@@ -313,48 +334,180 @@ def _targets(info: dict, name: str, w: LoraWeight):
     raise ValueError(f"unsupported LoRA module {name!r}")
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Z-Image, Qwen-Image, SDXL: LoRA names are the model's own (diffusers) module names
+
+
+def _qkv_size(module: nn.Module) -> int:
+    """Rows of a fused qkv projection (SVDQW4A4Linear or Z-Image's fused qkv + norm + RoPE module)."""
+    return module.qkv_out_features if hasattr(module, "qkv_out_features") else module.out_features
+
+
+def _native_name(name: str, kohya: dict[str, str]) -> str | None:
+    """Strip ComfyUI / diffusers / PEFT prefixes; resolve kohya ``lora_unet_a_b_0_c`` names against the model."""
+    if name.startswith("lora_unet_"):
+        return kohya.get(name[len("lora_unet_") :])
+    if name.startswith(("lora_te", "text_encoder", "te_", "te1_", "te2_")):
+        return None
+    return re.sub(r"^(model\.diffusion_model|diffusion_model|base_model\.model|transformer|unet)\.", "", name)
+
+
+def _native_targets(info: dict, lora: dict[str, LoraWeight]):
+    """Yield (module path, down, up) with up's scale folded in; fuses q/k/v and Z-Image's w1/w3."""
+    modules: dict[str, nn.Module] = info["modules"]
+    kind = info["kind"]
+    # kohya names are dotted paths with "." -> "_"; include the unfused names LoRAs are trained on
+    virtual = set(modules)
+    for path, m in modules.items():
+        for fused, parts in (
+            ("to_qkv", ("to_q", "to_k", "to_v")),
+            ("fused_module", ("to_q", "to_k", "to_v")),
+            ("add_qkv_proj", ("add_q_proj", "add_k_proj", "add_v_proj")),
+        ):
+            if path.endswith("." + fused):
+                virtual.update(path[: -len(fused)] + p for p in parts)
+        if kind == "zimage" and path.endswith(".feed_forward.net"):
+            virtual.update(path[: -len("net")] + w for w in ("w1", "w2", "w3"))
+    kohya = {v.replace(".", "_"): v for v in virtual}
+
+    named: dict[str, LoraWeight] = {}
+    ignored = 0
+    for name, w in lora.items():
+        native = _native_name(name, kohya)
+        if native is None:
+            ignored += 1
+        else:
+            named[native] = w
+    if ignored:
+        logger.warning("LoRA: ignoring %d text-encoder or unrecognized kohya weights", ignored)
+    missing = []
+
+    groups: dict[str, list] = {}  # fused target -> per-part LoraWeight (None where missing)
+    for name, w in named.items():
+        if m := re.fullmatch(r"(.+)\.(to_q|to_k|to_v|add_q_proj|add_k_proj|add_v_proj)", name):
+            base, part = m.groups()
+            add = part.startswith("add_")
+            target = (
+                f"{base}.add_qkv_proj"
+                if add
+                else next((f"{base}.{c}" for c in ("fused_module", "to_qkv") if f"{base}.{c}" in modules), None)
+            )
+            if target is not None:
+                idx = (
+                    ("add_q_proj", "add_k_proj", "add_v_proj").index(part)
+                    if add
+                    else ("to_q", "to_k", "to_v").index(part)
+                )
+                groups.setdefault(target, [None, None, None])[idx] = w
+                continue
+        if kind == "zimage" and (m := re.fullmatch(r"(.+\.feed_forward)\.(w1|w2|w3)", name)):
+            base, part = m.groups()
+            if part == "w2":
+                yield f"{base}.net.2", w.down, w.up * w.scale
+            else:  # net.0.proj rows are [up (w3) | gate (w1)], diffusers' SwiGLU order
+                groups.setdefault(f"{base}.net.0.proj", [None, None])[0 if part == "w3" else 1] = w
+            continue
+        if kind == "zimage" and (m := re.fullmatch(r"(.+\.attention)\.(qkv|out)", name)):  # ComfyUI-native names
+            base, part = m.groups()
+            name = (
+                next((f"{base}.{c}" for c in ("fused_module", "to_qkv") if f"{base}.{c}" in modules), name)
+                if part == "qkv"
+                else f"{base}.to_out.0"
+            )
+        if name not in modules:
+            missing.append(name)
+            continue
+        up = w.up * w.scale
+        if kind == "qwenimage" and re.fullmatch(r".+\.(img_mod|txt_mod)\.1", name):
+            up = up[_adaln_rows(6, up.shape[0] // 6)]
+        if w.kernel:
+            yield name, (w.down, w.kernel), up
+        else:
+            yield name, w.down, up
+    for target, parts in groups.items():
+        module = modules[target]
+        n = _qkv_size(module) if len(parts) == 3 else module.out_features
+        fused = _block_diag_cat(parts, [n // len(parts)] * len(parts))
+        up = fused.up
+        if len(parts) == 2 and getattr(modules[target[: -len(".net.0.proj")]], "swiglu_fused", False):
+            from ..ops.triton.native.w4a4 import interleave_swiglu
+
+            idx = (interleave_swiglu(n, torch.device("cpu")) + n // 2) % n  # rows of [up | gate]
+            up = up[idx]
+        yield target, fused.down, up
+    if missing:
+        logger.warning("LoRA: ignoring %d modules this model does not have, e.g. %s", len(missing), missing[:3])
+
+
 class _LoraHook:
-    """Forward hook adding ``sum_i (x @ down_i.T) @ up_i.T`` to a non-SVDQuant layer."""
+    """Forward hook adding ``sum_i up_i(down_i(x))`` to a layer without an SVDQuant low-rank branch."""
 
     def __init__(self):
-        self.pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self.pairs: list[tuple] = []
 
     def __call__(self, module, args, output):
         x = args[0]
-        if self.pairs and self.pairs[0][0].device != x.device:
-            self.pairs = [(d.to(x.device), u.to(x.device)) for d, u in self.pairs]
         for down, up in self.pairs:
-            output = output + ((x.to(down.dtype) @ down.t()) @ up.t()).to(output.dtype)
+            if down.device != x.device:  # the model moved since the LoRAs were attached
+                self.pairs = [(d.to(x.device), u.to(x.device)) for d, u in self.pairs]
+                return self(module, args, output)
+            if down.dim() == 4:  # conv LoRA: a k x k conv down to rank r, then a 1 x 1 conv up
+                h = torch.nn.functional.conv2d(
+                    x.to(down.dtype), down, None, module.stride, module.padding, module.dilation
+                )
+                output = output + torch.nn.functional.conv2d(h, up[:, :, None, None]).to(output.dtype)
+            else:
+                output = output + ((x.to(down.dtype) @ down.t()) @ up.t()).to(output.dtype)
         return output
+
+
+def _lowrank_prefix(module: nn.Module) -> str | None:
+    """Attribute prefix of the 16-bit low-rank branch: ``proj_down`` / ``proj_up`` of an SVDQW4A4Linear, or
+    ``qkv_proj_*`` of Z-Image's fused qkv module; None for other layers."""
+    from ..models.linear import SVDQW4A4Linear
+
+    if isinstance(module, SVDQW4A4Linear):
+        return ""
+    if hasattr(module, "qkv_proj_down") and hasattr(module, "qkv_proj_up"):
+        return "qkv_"
+    return None
 
 
 def attach_lora(module: nn.Module, pairs: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
     """
     Add ``sum_i (x @ down_i.T) @ up_i.T`` to one layer's output: appended to the low-rank branch of an
-    :class:`~nunchaku.models.linear.SVDQW4A4Linear` (rank zero-padded to a multiple of 16 for the native
-    kernels), otherwise through a forward hook. ``down`` (r, in), ``up`` (out, r), strength already folded
-    into ``up``. Undo with :func:`detach_lora`.
+    :class:`~nunchaku.models.linear.SVDQW4A4Linear` (or Z-Image's fused qkv module; rank zero-padded to a multiple
+    of 16 for the native kernels), otherwise through a forward hook. ``down`` (r, in), ``up`` (out, r), strength
+    already folded into ``up``; for a convolution ``down`` is ``(flattened weight, kernel size)``. Undo with
+    :func:`detach_lora`.
     """
-    from ..models.linear import SVDQW4A4Linear
-
     detach_lora(module)
-    if isinstance(module, SVDQW4A4Linear):
-        base_down, base_up = module.proj_down.data, module.proj_up.data
+    prefix = _lowrank_prefix(module)
+    if prefix is not None and not any(isinstance(d, tuple) for d, _ in pairs):
+        pd, pu = getattr(module, prefix + "proj_down"), getattr(module, prefix + "proj_up")
+        base_down, base_up = pd.data, pu.data
+        n_in, n_out = base_down.shape[0], base_up.shape[0]
         downs = [d.t() for d, _ in pairs]
         ups = [u for _, u in pairs]
         pad = -(base_down.shape[1] + sum(d.shape[1] for d in downs)) % 16
         if pad:
-            downs.append(torch.zeros(module.in_features, pad))
-            ups.append(torch.zeros(module.out_features, pad))
+            downs.append(torch.zeros(n_in, pad))
+            ups.append(torch.zeros(n_out, pad))
         dev, dt = base_down.device, base_down.dtype
-        module._lora_base = (base_down, base_up)
-        module.proj_down.data = torch.cat([base_down, torch.cat(downs, 1).to(dev, dt)], 1).contiguous()
-        module.proj_up.data = torch.cat([base_up, torch.cat(ups, 1).to(dev, dt)], 1).contiguous()
+        module._lora_base = (prefix, base_down, base_up)
+        pd.data = torch.cat([base_down, torch.cat(downs, 1).to(dev, dt)], 1).contiguous()
+        pu.data = torch.cat([base_up, torch.cat(ups, 1).to(dev, dt)], 1).contiguous()
     else:
         # the compute dtype: AWQ layers also hold packed integer weights
         p = next(p for p in module.parameters() if p.is_floating_point())
         hook = _LoraHook()
-        hook.pairs = [(d.to(p.device, p.dtype), u.to(p.device, p.dtype)) for d, u in pairs]
+        for d, u in pairs:
+            if isinstance(d, tuple):
+                if not isinstance(module, nn.Conv2d):
+                    raise ValueError(f"conv LoRA for a {type(module).__name__}")
+                d, kernel = d
+                d = d.view(d.shape[0], module.in_channels // module.groups, *kernel)
+            hook.pairs.append((d.to(p.device, p.dtype), u.to(p.device, p.dtype)))
         module._lora_hook = hook
         module._lora_hook_handle = module.register_forward_hook(hook)
 
@@ -362,8 +515,10 @@ def attach_lora(module: nn.Module, pairs: list[tuple[torch.Tensor, torch.Tensor]
 def detach_lora(module: nn.Module) -> None:
     """Remove what :func:`attach_lora` added (no-op if nothing is attached)."""
     if hasattr(module, "_lora_base"):
-        dev = module.proj_down.device  # the model may have moved since the LoRAs were attached
-        module.proj_down.data, module.proj_up.data = (t.to(dev) for t in module._lora_base)
+        prefix, base_down, base_up = module._lora_base
+        pd, pu = getattr(module, prefix + "proj_down"), getattr(module, prefix + "proj_up")
+        dev = pd.device  # the model may have moved since the LoRAs were attached
+        pd.data, pu.data = base_down.to(dev), base_up.to(dev)
         del module._lora_base
     if hasattr(module, "_lora_hook"):
         module._lora_hook_handle.remove()
@@ -372,9 +527,9 @@ def detach_lora(module: nn.Module) -> None:
 
 def set_loras(model: nn.Module, loras: list[tuple[str | PathLike | dict, float]]) -> None:
     """
-    Apply ``loras`` -- ``[(path, state dict or already-loaded {BFL name: LoraWeight}, strength), ...]`` -- to
-    a Nunchaku FLUX.1 / FLUX.2 transformer, replacing any LoRAs applied before. ``[]`` restores the base
-    model. Strength 0 entries are skipped.
+    Apply ``loras`` -- ``[(path, state dict or already-loaded {name: LoraWeight} from load_lora, strength), ...]``
+    -- to a Nunchaku FLUX.1 / FLUX.2 / Z-Image / Qwen-Image transformer or SDXL UNet, replacing any LoRAs applied
+    before. ``[]`` restores the base model. Strength 0 entries are skipped.
     """
     from ..ops.triton.native.w4a4 import interleave_swiglu
 
@@ -387,9 +542,12 @@ def set_loras(model: nn.Module, loras: list[tuple[str | PathLike | dict, float]]
             continue
         if not (isinstance(lora, dict) and lora and isinstance(next(iter(lora.values())), LoraWeight)):
             lora = load_lora(lora, info)
-        for name, w in lora.items():
-            for path, down, up in _targets(info, name, w):
-                per_module.setdefault(path, []).append((down, up * strength))
+        if info["kind"] in ("flux1", "flux2"):
+            targets = (tgt for name, w in lora.items() for tgt in _targets(info, name, w))
+        else:
+            targets = _native_targets(info, lora)
+        for path, down, up in targets:
+            per_module.setdefault(path, []).append((down, up * strength))
 
     modules = dict(model.named_modules())
     for path, pairs in per_module.items():

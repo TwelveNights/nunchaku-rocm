@@ -22,10 +22,30 @@ from comfy.ldm.flux.layers import EmbedND
 from comfy.ldm.qwen_image.model import QwenImageTransformer2DModel
 from torch import nn
 
+from .lora import LoraMixin
+
 logger = logging.getLogger(__name__)
 
 
-class NunchakuQwenImageAdapter(QwenImageTransformer2DModel):
+def _copy_block(src: nn.Module, dst: nn.Module) -> None:
+    """Copy an offloaded block into a GPU buffer block. LoRAs make a block's low-rank tensors larger, so a buffer
+    tensor is reallocated when its shape differs; LoRA hooks (layers without a low-rank branch) are carried over."""
+    with torch.no_grad():
+        for s, d in zip(list(src.parameters()) + list(src.buffers()), list(dst.parameters()) + list(dst.buffers())):
+            if d.shape != s.shape:
+                d.data = torch.empty(s.shape, dtype=s.dtype, device=d.device)
+            d.copy_(s, non_blocking=True)
+    for sm, dm in zip(src.modules(), dst.modules()):
+        hook = getattr(sm, "_lora_hook", None)
+        if hook is not None or hasattr(dm, "_lora_hook"):
+            from nunchaku.lora.runtime import attach_lora, detach_lora
+
+            detach_lora(dm)
+            if hook is not None:
+                attach_lora(dm, hook.pairs)
+
+
+class NunchakuQwenImageAdapter(LoraMixin, QwenImageTransformer2DModel):
     """
     ComfyUI ``diffusion_model`` wrapping a Nunchaku Qwen-Image transformer.
 
@@ -67,6 +87,8 @@ class NunchakuQwenImageAdapter(QwenImageTransformer2DModel):
         )
         self.transformer = transformer
         self._warned = set()
+        self._init_loras()
+        self.use_pin_memory = use_pin_memory
 
         blocks = list(transformer.transformer_blocks)
         self.offload = offload and num_blocks_on_gpu < len(blocks)
@@ -91,13 +113,27 @@ class NunchakuQwenImageAdapter(QwenImageTransformer2DModel):
             self._warned.add(key)
             logger.warning(msg)
 
+    def _apply_loras(self, requested: tuple) -> None:
+        # nunchaku.lora.runtime works on the module tree; register the offloaded blocks while it attaches
+        resident = self.transformer.transformer_blocks
+        if self.offload:
+            self.transformer.transformer_blocks = nn.ModuleList(self._blocks())
+        try:
+            super()._apply_loras(requested)
+        finally:
+            self.transformer.transformer_blocks = resident
+        if self.offload and self.use_pin_memory:
+            with torch.no_grad():
+                for block in self.__dict__["_offloaded_blocks"]:
+                    for p in block.parameters():
+                        if p.device.type == "cpu" and not p.data.is_pinned():
+                            p.data = p.data.pin_memory()
+
     def _blocks(self):
         resident = list(self.transformer.transformer_blocks)
         return resident + (self.__dict__["_offloaded_blocks"] if self.offload else [])
 
     def _run_blocks(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb):
-        from nunchaku.utils import copy_params_into
-
         blocks = self._blocks()
         num_resident = len(self.transformer.transformer_blocks)
         compute = torch.cuda.current_stream(hidden_states.device)
@@ -116,7 +152,7 @@ class NunchakuQwenImageAdapter(QwenImageTransformer2DModel):
                 with torch.cuda.stream(memory):
                     if free[slot] is not None:
                         memory.wait_event(free[slot])
-                    copy_params_into(blocks[j], self.offload_buffers[slot], non_blocking=True)
+                    _copy_block(blocks[j], self.offload_buffers[slot])
                     ready[slot] = torch.cuda.Event()
                     ready[slot].record(memory)
 
@@ -170,6 +206,8 @@ class NunchakuQwenImageAdapter(QwenImageTransformer2DModel):
             if masked:
                 # as in the Nunchaku diffusers model: text padding is attended to
                 self._warn_once("mask", "Nunchaku Qwen-Image: the text attention mask is ignored")
+
+        self._sync_loras(transformer_options)
 
         hidden_states, img_ids, orig_shape = self.process_img(x)
         num_embeds = hidden_states.shape[1]

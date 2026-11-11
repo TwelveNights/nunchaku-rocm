@@ -14,6 +14,7 @@ import torch
 from safetensors import safe_open
 
 from .adapter import NunchakuFluxAdapter
+from .lora import LoraMixin
 
 logger = logging.getLogger(__name__)
 
@@ -278,13 +279,11 @@ class NunchakuLoraLoader:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load"
     CATEGORY = "Nunchaku (ROCm)"
-    DESCRIPTION = "Applies a FLUX.1 / FLUX.2 [klein] LoRA (ComfyUI/BFL, kohya or diffusers format) to a Nunchaku model."
+    DESCRIPTION = "Applies a LoRA (ComfyUI, kohya or diffusers format) to a Nunchaku FLUX.1, FLUX.2 [klein], Z-Image, Qwen-Image or SDXL model."
 
     def load(self, model: comfy.model_patcher.ModelPatcher, lora_name: str, strength: float):
-        if not isinstance(model.model.diffusion_model, NunchakuFluxAdapter):
-            raise ValueError(
-                "Nunchaku LoRA Loader needs a FLUX.1 / FLUX.2 [klein] model from Nunchaku DiT Loader (ROCm)"
-            )
+        if not isinstance(model.model.diffusion_model, LoraMixin):
+            raise ValueError("Nunchaku LoRA Loader needs a model from Nunchaku DiT Loader (ROCm)")
         return (add_lora(model, folder_paths.get_full_path_or_raise("loras", lora_name), strength),)
 
 

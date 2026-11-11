@@ -18,10 +18,12 @@ import torch
 from comfy.ldm.lumina.model import NextDiT
 from torch import nn
 
+from .lora import LoraMixin
+
 logger = logging.getLogger(__name__)
 
 
-class NunchakuZImageAdapter(NextDiT):
+class NunchakuZImageAdapter(LoraMixin, NextDiT):
     """
     ComfyUI ``diffusion_model`` wrapping a Nunchaku Z-Image transformer.
 
@@ -44,6 +46,7 @@ class NunchakuZImageAdapter(NextDiT):
         self.out_channels = self.in_channels
         self.transformer = transformer
         self._warned = set()
+        self._init_loras()
 
     def _warn_once(self, key: str, msg: str) -> None:
         if key not in self._warned:
@@ -76,6 +79,8 @@ class NunchakuZImageAdapter(NextDiT):
             self._warn_once(
                 "patches", "Nunchaku: transformer patches (e.g. from model-patching nodes) are ignored by this model"
             )
+
+        self._sync_loras(transformer_options)
 
         h, w = x.shape[-2:]
         x = comfy.ldm.common_dit.pad_to_patch_size(x, (self.patch_size, self.patch_size))
