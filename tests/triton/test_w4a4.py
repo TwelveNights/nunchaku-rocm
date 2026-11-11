@@ -374,4 +374,7 @@ def test_gemm_w4a4_fused_next_layer_quant(dtype, fp4, R2):
     deq_qout = dequant(qout, oscales.float(), N, qgroup, fp4=fp4, unsigned=not fp4)
     err = (deq_qout - shifted_smoothed).abs().amax()
     scale_max = oscales.float().amax()
-    assert err <= scale_max * 1.05, f"max abs err {err} exceeds ~one quant step {scale_max}"
+    # Like the CUDA kernel, codes come from the unrounded scale but dequantize with the stored one: up to one step
+    # (the 4 -> 6 gap for e2m1) plus qmax times the scale's relative rounding (e4m3 2**-4, fp16/bf16 2**-8).
+    bound = 1.0 + 6.0 * 2**-4 if fp4 else 0.5 + 15.0 * 2**-8
+    assert err <= scale_max * bound, f"max abs err {err} exceeds {bound} quant steps of {scale_max}"
