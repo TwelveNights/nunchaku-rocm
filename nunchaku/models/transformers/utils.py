@@ -168,7 +168,8 @@ def patch_scale_key(transformer_from_config: nn.Module, state_dict_from_checkpoi
     for n, m in transformer_from_config.named_modules():
         if isinstance(m, SVDQW4A4Linear):
             if m.wtscale is not None:
-                m.wtscale = state_dict_from_checkpoint.pop(f"{n}.wtscale", 1.0)
+                # a float, as documented: the Triton kernels take alpha as a scalar argument, not a tensor
+                m.wtscale = float(state_dict_from_checkpoint.pop(f"{n}.wtscale", 1.0))
 
 
 def convert_fp16(transformer_from_config: nn.Module, state_dict_from_checkpoint: dict):

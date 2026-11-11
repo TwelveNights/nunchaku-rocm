@@ -20,7 +20,7 @@ from torch.nn import GELU
 
 from ...ops.backend import get_backend
 from ...ops.fused import fused_gelu_mlp
-from ...utils import get_precision, pad_tensor
+from ...utils import get_checkpoint_precision, pad_tensor
 from ..attention import NunchakuBaseAttention, NunchakuFeedForward
 from ..attention_processors.flux import NunchakuFluxFA2Processor, NunchakuFluxFP16AttnProcessor
 from ..embeddings import NunchakuFluxPosEmbed, pack_rotemb
@@ -414,9 +414,7 @@ class NunchakuFluxTransformer2DModelV2(FluxTransformer2DModel, NunchakuModelLoad
         rank = quantization_config.get("rank", 32)
         transformer = transformer.to(torch_dtype)
 
-        precision = get_precision()
-        if precision == "fp4":
-            precision = "nvfp4"
+        precision = get_checkpoint_precision(quantization_config)
         transformer._patch_model(precision=precision, rank=rank)
 
         transformer = transformer.to_empty(device=device)

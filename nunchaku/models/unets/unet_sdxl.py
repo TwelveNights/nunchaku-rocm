@@ -23,7 +23,7 @@ from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
 from huggingface_hub import utils
 from torch import nn
 
-from nunchaku.utils import get_precision
+from nunchaku.utils import get_checkpoint_precision
 
 from ...ops.backend import get_backend
 from ..attention import NunchakuBaseAttention, _patch_linear
@@ -511,9 +511,7 @@ class NunchakuSDXLUNet2DConditionModel(UNet2DConditionModel, NunchakuModelLoader
         rank = quantization_config.get("rank", 32)
         unet = unet.to(torch_dtype)
 
-        precision = get_precision()
-        if precision == "fp4":
-            precision = "nvfp4"
+        precision = get_checkpoint_precision(quantization_config)
 
         unet._patch_model(precision=precision, rank=rank)
         unet = unet.to_empty(device=device)

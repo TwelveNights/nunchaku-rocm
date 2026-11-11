@@ -336,6 +336,17 @@ def get_precision_from_quantization_config(quantization_config: dict) -> str:
         raise ValueError(f"Unsupported quantization dtype: {quantization_config['weight']['dtype']}")
 
 
+def get_checkpoint_precision(quantization_config: dict) -> str:
+    """
+    The checkpoint's precision ("int4" or "nvfp4") from its quantization config, or the device default when the
+    checkpoint doesn't record one.
+    """
+    if "weight" in quantization_config:
+        return get_precision_from_quantization_config(quantization_config)
+    precision = get_precision()
+    return "nvfp4" if precision == "fp4" else precision
+
+
 def copy_params_into(src: nn.Module, dst: nn.Module, non_blocking: bool = True):
     """
     Copy all parameters and buffers from a source module to a destination module.
