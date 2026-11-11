@@ -75,8 +75,7 @@ in a CUDA build of PyTorch).
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.0   # brings ROCm Triton along
-git clone https://github.com/TwelveNights/nunchaku-rocm.git
-pip install -e ./nunchaku-rocm
+pip install nunchaku-rocm
 ```
 
 **Windows 11** (Radeon RX 7000 / PRO W7000 series, a current AMD driver; no ROCm or Visual Studio install needed --
@@ -88,15 +87,14 @@ $R = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1"
 pip install "$R/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl" "$R/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl" `
     "$R/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl" "$R/rocm-7.2.1.tar.gz"
 pip install "$R/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl" "$R/torchvision-0.24.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl"
-pip install "triton-windows==3.6.0.post26"
-git clone https://github.com/TwelveNights/nunchaku-rocm.git
-pip install -e .\nunchaku-rocm
+pip install "triton-windows==3.6.0.post26" nunchaku-rocm
 # for Triton's compiler: put the ROCm SDK on PATH (in every new shell)
 $env:ROCM_HOME = (python -m rocm_sdk path --root); $env:HIP_PATH = $env:ROCM_HOME
 $env:PATH = "$env:ROCM_HOME\bin;$env:ROCM_HOME\lib\llvm\bin;$env:PATH"
 ```
 
-A "Failed to find MSVC" message from Triton is harmless. Check the install with
+For development, install a clone instead: `pip install -e ./nunchaku-rocm`. A "Failed to find MSVC" message from
+Triton is harmless. Check the install with
 `python -c "import torch, nunchaku; print(torch.cuda.get_device_name(0))"`. The backend is selected automatically
 (`NUNCHAKU_BACKEND=triton` forces it). The first run of a model compiles and autotunes the Triton kernels and builds
 the native kernels (about a minute); both are cached on disk (`TRITON_CACHE_DIR`, `NUNCHAKU_CACHE_DIR`, see
@@ -136,9 +134,12 @@ The other models work the same way with their pipelines (`QwenImagePipeline`, `Z
 
 ## Quick start: ComfyUI
 
-Install nunchaku-rocm into ComfyUI's Python environment, point ComfyUI at `comfyui/custom_nodes` and load a workflow
-from [`comfyui/workflows/`](comfyui/workflows). One node, **Nunchaku DiT Loader (ROCm)**, loads every model above
-(ComfyUI's own loaders handle the text encoders and VAEs), and **Nunchaku LoRA Loader (ROCm)** adds FLUX LoRAs. Setup
+Install the **[ComfyUI-nunchaku-rocm](https://github.com/TwelveNights/ComfyUI-nunchaku-rocm)** node pack with
+ComfyUI Manager: it installs nunchaku-rocm into ComfyUI's Python without touching its ROCm PyTorch (on the Windows
+portable for AMD GPUs also Triton and the ROCm SDK pieces it needs). One node, **Nunchaku DiT Loader (ROCm)**, loads
+every model above (ComfyUI's own loaders handle the text encoders and VAEs), and **Nunchaku LoRA Loader (ROCm)** adds
+LoRAs. The same nodes are in [`comfyui/custom_nodes`](comfyui/custom_nodes) here, with headless workflows in
+[`comfyui/workflows/`](comfyui/workflows). Setup
 for Windows and Linux, the model files, VRAM guidance for 16 GB cards and validation:
 **[`comfyui/README.md`](comfyui/README.md)**.
 

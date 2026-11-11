@@ -40,7 +40,6 @@ optional-dependencies.ci = [
   "datasets==3.6",
   "diffusers==0.36",
   "huggingface-hub==0.34",
-  "image-gen-aux @ git+https://github.com/asomoza/image_gen_aux.git@e08ae3d",
   "peft==0.17",
   "pytest==8.4.2",
   "pytest-rerunfailures==16.0.1",
@@ -51,14 +50,12 @@ optional-dependencies.ci = [
 optional-dependencies.demo = [
   "controlnet-aux",
   "gradio==5.39",
-  "image-gen-aux @ git+https://github.com/asomoza/image_gen_aux.git",
   "spaces",
 ]
 optional-dependencies.dev = [
   "cache-dit>=1.1.9",
   "controlnet-aux",
   "datasets<4",
-  "image-gen-aux @ git+https://github.com/asomoza/image_gen_aux.git",
   "pre-commit",
   "pytest",
   "pytest-rerunfailures",
@@ -83,9 +80,13 @@ optional-dependencies.docs = [
 ]
 optional-dependencies.full = [
   "controlnet-aux",
-  "image-gen-aux @ git+https://github.com/asomoza/image_gen_aux.git",
 ]
+urls.Homepage = "https://github.com/TwelveNights/nunchaku-rocm"
+urls.Issues = "https://github.com/TwelveNights/nunchaku-rocm/issues"
 urls.Upstream = "https://github.com/nunchaku-ai/nunchaku"
+
+[tool.setuptools.dynamic]
+version = { attr = "nunchaku.__version__.__version__" }
 
 [tool.setuptools.packages.find]
 include = [ "nunchaku", "nunchaku.*" ]
