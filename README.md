@@ -241,7 +241,7 @@ FLUX.1, FLUX.2 [klein], Qwen-Image, Z-Image and SDXL.
 From the same author, for 3D assets on AMD GPUs (e.g. from images made with nunchaku-rocm):
 [TripoSG-rocm](https://github.com/TwelveNights/TripoSG-rocm) (image to mesh) and
 [Hunyuan3D-2.1-rocm](https://github.com/TwelveNights/Hunyuan3D-2.1-rocm) (image to textured PBR model); both run on
-Windows without compiling anything.
+Windows without compiling anything, and both are in ComfyUI as [ComfyUI-3D-rocm](https://github.com/TwelveNights/ComfyUI-3D-rocm).
 
 ## Credits and license
 
