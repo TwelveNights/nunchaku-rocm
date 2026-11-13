@@ -238,6 +238,11 @@ nunchaku-rocm targets RDNA3 (gfx11) and CDNA3 (MI300X) GPUs on Linux and Windows
 compiled at runtime (no compiler installation needed, also on Windows), and supports both diffusers and ComfyUI for
 FLUX.1, FLUX.2 [klein], Qwen-Image, Z-Image and SDXL.
 
+From the same author, for 3D assets on AMD GPUs (e.g. from images made with nunchaku-rocm):
+[TripoSG-rocm](https://github.com/TwelveNights/TripoSG-rocm) (image to mesh) and
+[Hunyuan3D-2.1-rocm](https://github.com/TwelveNights/Hunyuan3D-2.1-rocm) (image to textured PBR model); both run on
+Windows without compiling anything.
+
 ## Credits and license
 
 nunchaku-rocm is a derivative of [Nunchaku](https://github.com/nunchaku-ai/nunchaku) by MIT HAN Lab and contributors
